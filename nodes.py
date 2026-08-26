@@ -274,6 +274,8 @@ class MiniMaxH3PDDAccApply:
         logging.info("MiniMaxH3PDDAccApply: %s (%s) steps=%d blocks=%s, %d lora modules, "
                      "heads fused", pdd_file, config["source_format"], len(sizes),
                      ",".join(map(str, sizes)), expected_modules)
+        if curve_note:
+            logging.info("MiniMaxH3PDDAccApply: %s", curve_note)
         return (m, sigmas, info)
 
 
