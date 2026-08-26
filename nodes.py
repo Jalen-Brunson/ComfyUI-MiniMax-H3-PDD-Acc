@@ -37,6 +37,7 @@ from .pdd_acc_core import (
     select_block,
     split_pdd_state_dict,
     table_sha,
+    warmup_schedule,
 )
 
 WRAPPER_KEY = "minimax_h3_pdd_acc"
@@ -309,12 +310,52 @@ class MiniMaxH3PDDAccScheduler:
         return (_sigmas_tensor(bounds),)
 
 
+class MiniMaxH3PDDAccWarmupScheduler:
+    """Two-phase schedule: undistilled-base warmup for identity/structure, PDD tail.
+
+    Wire sigmas into the sampler, phase2_start_step into MMH3LoopingSampler's
+    phase2_start_step (or SplitSigmas for a two-pass SamplerCustomAdvanced
+    graph). Phase 1 runs a guider on the BASE model (no PDD, no distill loras);
+    phase 2 runs the PDD-patched model's guider from the handoff boundary.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "warmup_steps": ("INT", {"default": 8, "min": 1, "max": 32,
+                                     "tooltip": "Base-model steps from sigma 1.0 to the handoff "
+                                                "(uniform in t; any sigmas are legal for the "
+                                                "undistilled base)."}),
+            "handoff_sigma": (["0.800000", "0.631579", "0.878049", "0.923077"],
+                              {"default": "0.800000",
+                               "tooltip": "PDD boundary where phase 2 takes over. 0.8 leaves the "
+                                          "last 2 trained blocks to PDD; 0.631579 leaves 1; "
+                                          "0.878049 leaves 3."}),
+        }}
+
+    RETURN_TYPES = ("SIGMAS", "INT", "STRING")
+    RETURN_NAMES = ("sigmas", "phase2_start_step", "info")
+    FUNCTION = "get_schedule"
+    CATEGORY = "sampling/custom_sampling/schedulers"
+
+    def get_schedule(self, warmup_steps, handoff_sigma):
+        sigmas, p2 = warmup_schedule(warmup_steps, float(handoff_sigma))
+        info = (f"phase 1: {p2} base steps {sigmas[0]:.3f}->{sigmas[p2]:.6f} | "
+                f"phase 2: {len(sigmas) - 1 - p2} PDD blocks "
+                f"{', '.join(f'{s:.6f}' for s in sigmas[p2:])}\n"
+                f"phase-1 guider = BASE model (no PDD/turbo), phase-2 guider = PDD model; "
+                f"euler both phases, CFG 1.0, SigmaShift 12/3.")
+        return (_sigmas_tensor(sigmas), p2, info)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3PDDAccApply": MiniMaxH3PDDAccApply,
     "MiniMaxH3PDDAccScheduler": MiniMaxH3PDDAccScheduler,
+    "MiniMaxH3PDDAccWarmupScheduler": MiniMaxH3PDDAccWarmupScheduler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3PDDAccApply": "MiniMax H3 PDD Acc LoRA (Apply)",
     "MiniMaxH3PDDAccScheduler": "MiniMax H3 PDD Acc Scheduler",
+    "MiniMaxH3PDDAccWarmupScheduler": "MiniMax H3 PDD Acc Warmup Scheduler (2-phase)",
 }

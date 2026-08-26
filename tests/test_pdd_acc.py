@@ -37,6 +37,7 @@ from pdd_acc_core import (  # noqa: E402
     select_block,
     shifted_sigma,
     split_pdd_state_dict,
+    warmup_schedule,
 )
 
 PDD_FILE = "/workspace/ComfyUI/models/pdd_acc/MiniMax-H3-FL2VA-Acc-8Step.safetensors"
@@ -331,6 +332,34 @@ def test_split_both_formats_roundtrip():
         assert torch.equal(lora1[k], lora2[k]), k
     for a, b in zip(heads1, heads2):
         assert torch.equal(a, b)
+
+
+def test_warmup_schedule():
+    knots = fine_sigmas(VIDEO_SHIFT, 32)[::4]
+    sigmas, p2 = warmup_schedule(8, 0.800000)
+    assert p2 == 8 and len(sigmas) == 11
+    assert abs(sigmas[8] - 0.8) < 1e-9            # handoff lands exactly on the knot
+    assert abs(sigmas[9] - knots[7]) < 1e-12      # 0.631579...
+    assert sigmas[10] == 0.0
+    assert all(a > b for a, b in zip(sigmas, sigmas[1:]))
+    # warmup segment is uniform in pre-shift t
+    ts = [s / (VIDEO_SHIFT - (VIDEO_SHIFT - 1) * s) for s in sigmas[:9]]
+    dts = [a - b for a, b in zip(ts, ts[1:])]
+    assert max(dts) - min(dts) < 1e-12
+    # phase-2 sigmas are all boundaries of the trained 8-step grid -> arming works
+    bounds = block_boundaries(32, resolve_partition(32, 8))
+    for s in sigmas[8:-1]:
+        assert select_block(s, bounds, "error") >= 0
+    # other handoffs
+    sig2, p2b = warmup_schedule(6, 0.631579)
+    assert p2b == 6 and len(sig2) == 8 and abs(sig2[6] - knots[7]) < 1e-4
+    sig3, _ = warmup_schedule(4, 0.878049)
+    assert [round(s, 6) for s in sig3[4:]] == [0.878049, 0.8, 0.631579, 0.0]
+    try:
+        warmup_schedule(8, 0.9)
+        raise AssertionError("off-grid handoff must be rejected")
+    except ValueError:
+        pass
 
 
 def test_curve_rebase_equivalence():

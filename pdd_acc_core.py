@@ -207,6 +207,30 @@ def convert_pdd_lora(sd, alpha):
     return out, leftovers
 
 
+def warmup_schedule(warmup_steps, handoff_sigma, num_steps=32):
+    """Two-phase schedule: undistilled-base warmup, PDD tail.
+
+    Phase 1: `warmup_steps` uniform-in-t steps from sigma 1.0 down to the
+    handoff knot (base model — any sigmas are legal there). Phase 2: the
+    trained PDD block boundaries from the handoff to 0. The handoff must be an
+    nfe-8 grid knot so the tail stays on the trained grid for any Apply-node
+    partition that includes it. Returns (sigmas, phase2_start_step).
+    """
+    knots = fine_sigmas(VIDEO_SHIFT, num_steps)[:: num_steps // 8]
+    matches = [s for s in knots[1:-1] if abs(s - handoff_sigma) <= 1e-4]
+    if not matches:
+        pretty = ", ".join(f"{s:.6f}" for s in knots[1:-1])
+        raise ValueError(f"handoff sigma {handoff_sigma} is not an interior PDD boundary "
+                         f"[{pretty}]")
+    handoff = matches[0]
+    t_handoff = handoff / (VIDEO_SHIFT - (VIDEO_SHIFT - 1.0) * handoff)
+    warm = [shifted_sigma(VIDEO_SHIFT, 1.0 + (t_handoff - 1.0) * i / warmup_steps)
+            for i in range(warmup_steps + 1)]
+    tail = [s for s in knots if s < handoff - 1e-9]
+    sigmas = warm + tail  # warm ends exactly at the handoff knot; tail continues to 0.0
+    return sigmas, warmup_steps
+
+
 # ---------------------------------------------------------------------------
 # pruned (curve-form adaln) support
 # ---------------------------------------------------------------------------
