@@ -326,11 +326,14 @@ class MiniMaxH3PDDAccWarmupScheduler:
                                      "tooltip": "Base-model steps from sigma 1.0 to the handoff "
                                                 "(uniform in t; any sigmas are legal for the "
                                                 "undistilled base)."}),
-            "handoff_sigma": (["0.800000", "0.631579", "0.878049", "0.923077"],
+            "handoff_sigma": (["0.800000", "0.631579", "0.878049", "0.923077",
+                               "0.952381", "0.972973", "0.988235"],
                               {"default": "0.800000",
-                               "tooltip": "PDD boundary where phase 2 takes over. 0.8 leaves the "
-                                          "last 2 trained blocks to PDD; 0.631579 leaves 1; "
-                                          "0.878049 leaves 3."}),
+                               "tooltip": "PDD boundary where phase 2 takes over = how many PDD "
+                                          "evals finish the run: 0.631579->1, 0.8->2, "
+                                          "0.878049->3, 0.923077->4, 0.952381->5, 0.972973->6, "
+                                          "0.988235->7. Keep the Apply node at nfe 8 (the tail "
+                                          "is on the block-4 grid)."}),
         }}
 
     RETURN_TYPES = ("SIGMAS", "INT", "STRING")

@@ -359,6 +359,11 @@ def test_warmup_schedule():
     assert p2b == 6 and len(sig2) == 8 and abs(sig2[6] - knots[7]) < 1e-4
     sig3, _ = warmup_schedule(4, 0.878049)
     assert [round(s, 6) for s in sig3[4:]] == [0.878049, 0.8, 0.631579, 0.0]
+    # 2 base + 6 PDD: uniform-t warmup evals land exactly on the first trained knots
+    sig4, p4 = warmup_schedule(2, 0.972973)
+    assert p4 == 2 and len(sig4) == 9
+    assert [round(s, 6) for s in sig4] == [1.0, 0.988235, 0.972973, 0.952381,
+                                           0.923077, 0.878049, 0.8, 0.631579, 0.0]
     try:
         warmup_schedule(8, 0.9)
         raise AssertionError("off-grid handoff must be rejected")
