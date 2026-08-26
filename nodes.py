@@ -32,6 +32,7 @@ from .pdd_acc_core import (
     block_boundaries,
     fine_sigmas,
     fuse_heads,
+    resolve_partition,
     select_block,
     split_pdd_state_dict,
 )
@@ -135,10 +136,11 @@ class MiniMaxH3PDDAccApply:
                          {"tooltip": "PDD Acc file from models/pdd_acc — the original "
                                      "alibaba-pai release or a converted ComfyUI copy, both "
                                      "load. Pair FL2VA with an fl2va UNET, Ref2VA with ref2va."}),
-            "nfe": (["8", "4", "16", "32"],
+            "nfe": (["8", "4", "6", "16", "32"],
                     {"default": "8",
                      "tooltip": "Model evaluations (sampler steps). 8 = trained block size 4. "
                                 "4 regroups two blocks per step (faster, paper-sanctioned); "
+                                "6 uses the non-uniform default partition 8,8,4,4,4,4; "
                                 "16/32 use shorter blocks (features slightly off-distribution)."}),
             "lora_strength": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.01,
                                         "tooltip": "Trunk LoRA strength. Trained at 1.0."}),
@@ -149,6 +151,13 @@ class MiniMaxH3PDDAccApply:
                             {"default": "error",
                              "tooltip": "What to do when the model is evaluated at a sigma that is "
                                         "not a trained block boundary (wrong sampler/scheduler)."}),
+        }, "optional": {
+            "partition": ("STRING", {"default": "",
+                                     "tooltip": "Custom block sizes in fine steps, comma-separated, "
+                                                "summing to 32 (e.g. '8,8,4,4,4,4' = 6 steps, or "
+                                                "'8,4,4,4,4,4,4' = 7). Overrides nfe. Sizes 4 and 8 "
+                                                "on multiple-of-4 starts stay inside the "
+                                                "officially demonstrated envelope."}),
         }}
 
     RETURN_TYPES = ("MODEL", "SIGMAS", "STRING")
@@ -160,14 +169,13 @@ class MiniMaxH3PDDAccApply:
                    "sigmas output to SamplerCustomAdvanced and sample with euler, CFG 1.0, "
                    "SigmaShift 12/3. Remove other distill LoRAs (turbo) and cache nodes.")
 
-    def apply(self, model, pdd_file, nfe, lora_strength, head_strength, on_off_grid):
+    def apply(self, model, pdd_file, nfe, lora_strength, head_strength, on_off_grid, partition=""):
         nfe = int(nfe)
         path = folder_paths.get_full_path_or_raise("pdd_acc", pdd_file)
         sd, metadata = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
         lora_sd, (vw, vb, aw, ab), config = split_pdd_state_dict(sd, metadata, pdd_file)
         num_steps = config["num_steps"]
-        if num_steps % nfe != 0:
-            raise ValueError(f"nfe {nfe} must divide pdd_num_steps {num_steps}")
+        sizes = resolve_partition(num_steps, nfe, partition)
 
         # ---- trunk LoRA (normal quant-aware patch path) ----
         expected_modules = sum(1 for k in lora_sd if k.endswith(".lora_A.weight"))
@@ -191,10 +199,10 @@ class MiniMaxH3PDDAccApply:
 
         fine_v = fine_sigmas(VIDEO_SHIFT, num_steps)
         fine_a = fine_sigmas(AUDIO_SHIFT, num_steps)
-        vW, vB = fuse_heads(vw, vb, fine_v, nfe)
-        aW, aB = fuse_heads(aw, ab, fine_a, nfe)
+        vW, vB = fuse_heads(vw, vb, fine_v, sizes)
+        aW, aB = fuse_heads(aw, ab, fine_a, sizes)
         heads = HeadBank(vW, vB, aW, aB)
-        bounds = block_boundaries(num_steps, nfe)
+        bounds = block_boundaries(num_steps, sizes)
 
         holder = SimpleNamespace(sigma_v=None)
         m.add_object_patch(
@@ -207,8 +215,8 @@ class MiniMaxH3PDDAccApply:
         sigmas = _sigmas_tensor(bounds)
         info = (
             f"PDD Acc: {pdd_file} ({config['source_format']} format)\n"
-            f"grid {num_steps} fine steps (trained block {config['block_size']}) -> nfe {nfe} "
-            f"(block {num_steps // nfe})\n"
+            f"grid {num_steps} fine steps (trained block {config['block_size']}) -> "
+            f"{len(sizes)} steps, blocks {','.join(map(str, sizes))}\n"
             f"lora: {expected_modules} modules @ strength {lora_strength} "
             f"(alpha {config['alpha']})\n"
             f"heads: video {list(vW.shape)}, audio {list(aW.shape)} fp32, "
@@ -217,8 +225,9 @@ class MiniMaxH3PDDAccApply:
             f"recipe: euler + these sigmas, CFG 1.0, SigmaShift 12/3. No turbo LoRA, no "
             f"T8/EasyCache/Spectrum, no PDD on a hybrid-merged trunk (untested)."
         )
-        logging.info("MiniMaxH3PDDAccApply: %s (%s) nfe=%d, %d lora modules, heads fused",
-                     pdd_file, config["source_format"], nfe, expected_modules)
+        logging.info("MiniMaxH3PDDAccApply: %s (%s) steps=%d blocks=%s, %d lora modules, "
+                     "heads fused", pdd_file, config["source_format"], len(sizes),
+                     ",".join(map(str, sizes)), expected_modules)
         return (m, sigmas, info)
 
 
@@ -226,10 +235,14 @@ class MiniMaxH3PDDAccScheduler:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "nfe": (["8", "4", "16", "32"], {"default": "8"}),
+            "nfe": (["8", "4", "6", "16", "32"], {"default": "8"}),
             "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                                  "tooltip": "Keep only the last round(nfe*denoise) blocks "
+                                  "tooltip": "Keep only the last round(steps*denoise) blocks "
                                              "(v2v-style partial denoise on the trained grid)."}),
+        }, "optional": {
+            "partition": ("STRING", {"default": "",
+                                     "tooltip": "Custom block sizes summing to 32, overrides nfe — "
+                                                "must match the Apply node's partition."}),
         }}
 
     RETURN_TYPES = ("SIGMAS",)
@@ -239,11 +252,11 @@ class MiniMaxH3PDDAccScheduler:
                    "output is the same thing at denoise 1.0 — use this one for partial-denoise "
                    "or split-sigma workflows. nfe must match the Apply node.")
 
-    def get_sigmas(self, nfe, denoise):
-        nfe = int(nfe)
-        bounds = block_boundaries(32, nfe)
+    def get_sigmas(self, nfe, denoise, partition=""):
+        sizes = resolve_partition(32, int(nfe), partition)
+        bounds = block_boundaries(32, sizes)
         if denoise < 1.0:
-            keep = max(1, int(round(nfe * denoise)))
+            keep = max(1, int(round(len(sizes) * denoise)))
             bounds = bounds[-(keep + 1):]
         return (_sigmas_tensor(bounds),)
 

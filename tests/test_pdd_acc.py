@@ -32,6 +32,7 @@ from pdd_acc_core import (  # noqa: E402
     convert_pdd_lora,
     fine_sigmas,
     fuse_heads,
+    resolve_partition,
     select_block,
     shifted_sigma,
     split_pdd_state_dict,
@@ -86,18 +87,22 @@ def test_fusion_matches_reference_head():
     n, out_dim, in_dim = 32, 6, 10
     bank_w = torch.randn(n, out_dim, in_dim, dtype=torch.float64)
     bank_b = torch.randn(n, out_dim, dtype=torch.float64)
+    partitions = [resolve_partition(n, nfe) for nfe in (4, 8, 16, 32)]
+    partitions.append(resolve_partition(n, 6))            # default 8,8,4,4,4,4
+    partitions.append((8, 4, 4, 4, 4, 4, 4))              # custom 7-step
     for shift in (VIDEO_SHIFT, AUDIO_SHIFT):
-        for nfe in (4, 8, 16, 32):
-            L = n // nfe
+        for sizes in partitions:
             fine = fine_sigmas(shift, n)
-            fw, fb = fuse_heads(bank_w, bank_b, fine, nfe)
+            fw, fb = fuse_heads(bank_w, bank_b, fine, sizes)
             steps = ref.pdd_time_grid(shift, n).diff()
-            for b in range(nfe):
-                plan = ref.pdd_sampling_plan(steps, b * L, L)  # (1, n)
+            start = 0
+            for b, size in enumerate(sizes):
+                plan = ref.pdd_sampling_plan(steps, start, size)  # (1, n)
                 want_w = torch.einsum("pn,noi->poi", plan, bank_w).flatten(0, 1)
                 want_b = torch.einsum("pn,no->po", plan, bank_b).flatten()
-                assert torch.allclose(fw[b].double(), want_w, atol=1e-6), (shift, nfe, b)
-                assert torch.allclose(fb[b].double(), want_b, atol=1e-6), (shift, nfe, b)
+                assert torch.allclose(fw[b].double(), want_w, atol=1e-6), (shift, sizes, b)
+                assert torch.allclose(fb[b].double(), want_b, atol=1e-6), (shift, sizes, b)
+                start += size
 
 
 def test_fusion_identity_at_full_nfe():
@@ -105,7 +110,7 @@ def test_fusion_identity_at_full_nfe():
     bank_w = torch.randn(32, 4, 5)
     bank_b = torch.randn(32, 4)
     fine = fine_sigmas(VIDEO_SHIFT, 32)
-    fw, fb = fuse_heads(bank_w, bank_b, fine, 32)
+    fw, fb = fuse_heads(bank_w, bank_b, fine, resolve_partition(32, 32))
     assert torch.allclose(fw, bank_w, atol=1e-6)
     assert torch.allclose(fb, bank_b, atol=1e-6)
 
@@ -114,7 +119,7 @@ def test_boundaries_match_diffusers_set_timesteps():
     # diffusers MiniMaxH3Scheduler.set_timesteps(N): shift*base/(1+(shift-1)*base),
     # base = linspace(1, 0, N). PDD runs it with N = nfe + 1 points.
     for nfe in (4, 8, 16, 32):
-        bounds = block_boundaries(32, nfe)
+        bounds = block_boundaries(32, resolve_partition(32, nfe))
         base = torch.linspace(1.0, 0.0, nfe + 1, dtype=torch.float64)
         want = (VIDEO_SHIFT * base / (1 + (VIDEO_SHIFT - 1) * base)).tolist()
         assert len(bounds) == nfe + 1
@@ -125,8 +130,37 @@ def test_boundaries_match_diffusers_set_timesteps():
         assert bounds == fine[:: 32 // nfe]
 
 
+def test_partition_resolution_and_boundaries():
+    # default 6-step partition: knots on the fine grid, sizes in the demonstrated {4,8}
+    sizes = resolve_partition(32, 6)
+    assert sizes == (8, 8, 4, 4, 4, 4)
+    fine = fine_sigmas(VIDEO_SHIFT, 32)
+    bounds = block_boundaries(32, sizes)
+    assert bounds == [fine[k] for k in (0, 8, 16, 20, 24, 28, 32)]
+    assert bounds[0] == 1.0 and bounds[-1] == 0.0
+    # every 6-step boundary is also an 8-step (block-4) grid knot
+    eight = block_boundaries(32, resolve_partition(32, 8))
+    assert set(bounds) <= set(eight) | {0.0}
+    # explicit text partition overrides nfe
+    assert resolve_partition(32, 8, "8,4,4,4,4,4,4") == (8, 4, 4, 4, 4, 4, 4)
+    # off-envelope but well-defined partitions are allowed (like nfe 16/32)
+    assert resolve_partition(32, 8, "7,7,7,7,4") == (7, 7, 7, 7, 4)
+    for bad in ("8,8,8", "6,6,6,6,6", "0,32", "abc", "8,8,8,9"):
+        try:
+            resolve_partition(32, 8, bad)
+            raise AssertionError(f"partition '{bad}' should be rejected")
+        except ValueError:
+            pass
+    # nfe that neither divides nor has a default
+    try:
+        resolve_partition(32, 7)
+        raise AssertionError("nfe 7 without partition should be rejected")
+    except ValueError:
+        pass
+
+
 def test_select_block():
-    bounds = block_boundaries(32, 8)
+    bounds = block_boundaries(32, resolve_partition(32, 8))
     for b in range(8):
         assert select_block(bounds[b], bounds, "error") == b
         assert select_block(bounds[b] + 5e-7, bounds, "error") == b
@@ -193,7 +227,7 @@ def test_audio_carried_step_exact():
     # maps returned v_a to (1-s)*x_a + (s/c_i)*v_a and euler steps y over dsv.
     # Claim: the resulting x_a advance equals dsa * v_a EXACTLY per finite step.
     s = VIDEO_SHIFT / AUDIO_SHIFT
-    bounds = block_boundaries(32, 8)
+    bounds = block_boundaries(32, resolve_partition(32, 8))
     fine_a = fine_sigmas(AUDIO_SHIFT, 32)
     audio_bounds = fine_a[::4]
     for i in range(8):

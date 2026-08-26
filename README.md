@@ -37,7 +37,13 @@ and installs the PDD head bank on `final_layer`, armed per step **by sigma** —
 chunked samplers, resumes and split schedules can't desync it.
 
 - **nfe** — model evaluations. `8` = trained block size (default). `4` regroups two blocks
-  per step (officially sanctioned — the release demos both). `16`/`32` use shorter blocks.
+  per step (officially sanctioned — the release demos both). `6` uses the non-uniform default
+  partition `8,8,4,4,4,4` (the two merged size-8 blocks sit at high sigma where the block
+  boundaries span almost no sigma, and the late heavyweight blocks stay at trained size —
+  every knot stays on the trained fine grid). `16`/`32` use shorter blocks.
+- **partition** (optional) — custom block sizes in fine steps, comma-separated, summing to 32
+  (e.g. `8,4,4,4,4,4,4` for 7 steps). Overrides `nfe`; the sigmas output follows. Sizes 4 and 8
+  on multiple-of-4 starts stay inside the officially demonstrated envelope.
 - **lora_strength / head_strength** — trained at 1.0 / 1.0.
 - **on_off_grid** — `error` (default): refuse evaluation at sigmas that are not trained block
   boundaries, with a message telling you what to fix. `clamp`: nearest block, degraded output.

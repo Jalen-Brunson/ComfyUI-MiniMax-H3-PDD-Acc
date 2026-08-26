@@ -42,27 +42,62 @@ def fine_sigmas(shift, num_steps):
     return [shifted_sigma(shift, (num_steps - i) / num_steps) for i in range(num_steps + 1)]
 
 
-def block_boundaries(num_steps, nfe):
+# Non-uniform step counts that don't divide the fine grid get a default
+# partition (block sizes in fine steps). 6: merge the early high-sigma blocks
+# (they span almost no sigma, so block-start feature staleness is minimal) and
+# keep the heavyweight late blocks at the trained size 4; the size-8 blocks
+# start at multiples of 8, exactly like the official 4-NFE regrouping.
+DEFAULT_PARTITIONS = {6: (8, 8, 4, 4, 4, 4)}
+
+
+def resolve_partition(num_steps, nfe, partition_text=""):
+    """Return the tuple of block sizes (in fine steps) for an nfe / partition spec."""
+    text = (partition_text or "").strip()
+    if text:
+        try:
+            sizes = tuple(int(p) for p in text.replace(" ", "").split(",") if p)
+        except ValueError:
+            raise ValueError(f"partition '{partition_text}' is not a comma-separated int list")
+        if any(s < 1 for s in sizes) or sum(sizes) != num_steps:
+            raise ValueError(f"partition {sizes} must be positive block sizes summing to "
+                             f"{num_steps} (got sum {sum(sizes)})")
+        return sizes
+    if num_steps % nfe == 0:
+        return (num_steps // nfe,) * nfe
+    if nfe in DEFAULT_PARTITIONS and sum(DEFAULT_PARTITIONS[nfe]) == num_steps:
+        return DEFAULT_PARTITIONS[nfe]
+    raise ValueError(f"nfe {nfe} does not divide pdd_num_steps {num_steps} and has no default "
+                     f"partition — supply one via the partition field (block sizes summing to "
+                     f"{num_steps}, e.g. '8,8,4,4,4,4')")
+
+
+def partition_starts(sizes):
+    starts = [0]
+    for s in sizes[:-1]:
+        starts.append(starts[-1] + s)
+    return starts
+
+
+def block_boundaries(num_steps, sizes):
+    """Video-sigma boundaries of a partition: descending, len(sizes)+1, ends at 0."""
     fine = fine_sigmas(VIDEO_SHIFT, num_steps)
-    step = num_steps // nfe
-    return [fine[b * step] for b in range(nfe + 1)]
+    knots = partition_starts(sizes) + [num_steps]
+    return [fine[k] for k in knots]
 
 
-def fuse_heads(bank_w, bank_b, fine, nfe):
-    """Fuse per-fine-interval velocity heads into nfe per-block heads.
+def fuse_heads(bank_w, bank_b, fine, sizes):
+    """Fuse per-fine-interval velocity heads into one head per partition block.
 
     Plan weights are the block's fine step sizes normalized to the block span,
     per modality — identical to the reference einsum('pn,noi->poi', plan, bank).
     """
-    n = bank_w.shape[0]
-    L = n // nfe
-    d = [fine[k] - fine[k + 1] for k in range(n)]
+    d = [fine[k] - fine[k + 1] for k in range(bank_w.shape[0])]
     w64 = bank_w.to(torch.float64)
     b64 = bank_b.to(torch.float64)
     fused_w = []
     fused_b = []
-    for b in range(nfe):
-        ks = list(range(b * L, (b + 1) * L))
+    for start, size in zip(partition_starts(sizes), sizes):
+        ks = list(range(start, start + size))
         span = sum(d[k] for k in ks)
         fw = sum((d[k] / span) * w64[k] for k in ks)
         fb = sum((d[k] / span) * b64[k] for k in ks)
