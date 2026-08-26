@@ -51,8 +51,17 @@ def fine_sigmas(shift, num_steps):
 DEFAULT_PARTITIONS = {6: (8, 8, 4, 4, 4, 4)}
 
 
-def resolve_partition(num_steps, nfe, partition_text=""):
-    """Return the tuple of block sizes (in fine steps) for an nfe / partition spec."""
+def resolve_partition(num_steps, nfe, partition_text="", trained_block=4):
+    """Return the tuple of block sizes (in fine steps) for an nfe / partition spec.
+
+    Sizes are restricted to {trained_block, 2*trained_block} (4 and 8 for the
+    released files): PDD heads are conditioned on trunk features from block
+    STARTS at multiples of L_min=trained_block with sizes up to L_max=2*L_min —
+    the two officially demonstrated groupings. Evaluating the trunk anywhere
+    else feeds the heads features they never trained on; empirically (fl2va,
+    nfe 32, 2026-08-27 reports + local repro) that renders as heavy noise, so
+    off-envelope partitions are rejected rather than allowed to degrade.
+    """
     text = (partition_text or "").strip()
     if text:
         try:
@@ -62,14 +71,24 @@ def resolve_partition(num_steps, nfe, partition_text=""):
         if any(s < 1 for s in sizes) or sum(sizes) != num_steps:
             raise ValueError(f"partition {sizes} must be positive block sizes summing to "
                              f"{num_steps} (got sum {sum(sizes)})")
-        return sizes
-    if num_steps % nfe == 0:
-        return (num_steps // nfe,) * nfe
-    if nfe in DEFAULT_PARTITIONS and sum(DEFAULT_PARTITIONS[nfe]) == num_steps:
-        return DEFAULT_PARTITIONS[nfe]
-    raise ValueError(f"nfe {nfe} does not divide pdd_num_steps {num_steps} and has no default "
-                     f"partition — supply one via the partition field (block sizes summing to "
-                     f"{num_steps}, e.g. '8,8,4,4,4,4')")
+    elif num_steps % nfe == 0:
+        sizes = (num_steps // nfe,) * nfe
+    elif nfe in DEFAULT_PARTITIONS and sum(DEFAULT_PARTITIONS[nfe]) == num_steps:
+        sizes = DEFAULT_PARTITIONS[nfe]
+    else:
+        raise ValueError(f"nfe {nfe} does not divide pdd_num_steps {num_steps} and has no "
+                         f"default partition — supply one via the partition field (block sizes "
+                         f"summing to {num_steps}, e.g. '8,8,4,4,4,4')")
+    allowed = (trained_block, 2 * trained_block)
+    bad = sorted({s for s in sizes if s not in allowed})
+    if bad:
+        raise ValueError(
+            f"partition {sizes}: block sizes {bad} are outside the trained envelope "
+            f"{allowed}. PDD heads only ever saw trunk features from block starts on the "
+            f"L_min={trained_block} grid with blocks of {allowed[0]} or {allowed[1]} fine "
+            f"steps; anything else renders as heavy noise (verified on fl2va). Use nfe "
+            f"8/6/4 or a partition made of {allowed[0]}s and {allowed[1]}s.")
+    return sizes
 
 
 def partition_starts(sizes):

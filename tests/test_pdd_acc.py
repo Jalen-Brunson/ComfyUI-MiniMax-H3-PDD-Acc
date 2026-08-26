@@ -88,7 +88,9 @@ def test_fusion_matches_reference_head():
     n, out_dim, in_dim = 32, 6, 10
     bank_w = torch.randn(n, out_dim, in_dim, dtype=torch.float64)
     bank_b = torch.randn(n, out_dim, dtype=torch.float64)
-    partitions = [resolve_partition(n, nfe) for nfe in (4, 8, 16, 32)]
+    # fuse_heads is pure math over any partition; envelope policy lives in
+    # resolve_partition, so off-envelope sizes are exercised here directly
+    partitions = [(8,) * 4, (4,) * 8, (2,) * 16, (1,) * 32]
     partitions.append(resolve_partition(n, 6))            # default 8,8,4,4,4,4
     partitions.append((8, 4, 4, 4, 4, 4, 4))              # custom 7-step
     for shift in (VIDEO_SHIFT, AUDIO_SHIFT):
@@ -111,7 +113,7 @@ def test_fusion_identity_at_full_nfe():
     bank_w = torch.randn(32, 4, 5)
     bank_b = torch.randn(32, 4)
     fine = fine_sigmas(VIDEO_SHIFT, 32)
-    fw, fb = fuse_heads(bank_w, bank_b, fine, resolve_partition(32, 32))
+    fw, fb = fuse_heads(bank_w, bank_b, fine, (1,) * 32)
     assert torch.allclose(fw, bank_w, atol=1e-6)
     assert torch.allclose(fb, bank_b, atol=1e-6)
 
@@ -120,7 +122,8 @@ def test_boundaries_match_diffusers_set_timesteps():
     # diffusers MiniMaxH3Scheduler.set_timesteps(N): shift*base/(1+(shift-1)*base),
     # base = linspace(1, 0, N). PDD runs it with N = nfe + 1 points.
     for nfe in (4, 8, 16, 32):
-        bounds = block_boundaries(32, resolve_partition(32, nfe))
+        sizes = resolve_partition(32, nfe) if nfe in (4, 8) else (32 // nfe,) * nfe
+        bounds = block_boundaries(32, sizes)
         base = torch.linspace(1.0, 0.0, nfe + 1, dtype=torch.float64)
         want = (VIDEO_SHIFT * base / (1 + (VIDEO_SHIFT - 1) * base)).tolist()
         assert len(bounds) == nfe + 1
@@ -144,20 +147,21 @@ def test_partition_resolution_and_boundaries():
     assert set(bounds) <= set(eight) | {0.0}
     # explicit text partition overrides nfe
     assert resolve_partition(32, 8, "8,4,4,4,4,4,4") == (8, 4, 4, 4, 4, 4, 4)
-    # off-envelope but well-defined partitions are allowed (like nfe 16/32)
-    assert resolve_partition(32, 8, "7,7,7,7,4") == (7, 7, 7, 7, 4)
-    for bad in ("8,8,8", "6,6,6,6,6", "0,32", "abc", "8,8,8,9"):
+    # OFF-ENVELOPE partitions are rejected: heads only trained on block starts at
+    # multiples of 4 with sizes 4/8 — nfe 32 renders as heavy noise (2026-08-27 repro)
+    for bad in ("8,8,8", "6,6,6,6,6", "0,32", "abc", "8,8,8,9",
+                "7,7,7,7,4", "2," * 15 + "2", "16,16", "12,4,4,4,4,4"):
         try:
             resolve_partition(32, 8, bad)
             raise AssertionError(f"partition '{bad}' should be rejected")
         except ValueError:
             pass
-    # nfe that neither divides nor has a default
-    try:
-        resolve_partition(32, 7)
-        raise AssertionError("nfe 7 without partition should be rejected")
-    except ValueError:
-        pass
+    for bad_nfe in (7, 16, 32):
+        try:
+            resolve_partition(32, bad_nfe)
+            raise AssertionError(f"nfe {bad_nfe} should be rejected")
+        except ValueError:
+            pass
 
 
 def test_select_block():

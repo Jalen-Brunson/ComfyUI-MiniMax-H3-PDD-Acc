@@ -178,12 +178,12 @@ class MiniMaxH3PDDAccApply:
                          {"tooltip": "PDD Acc file from models/pdd_acc — the original "
                                      "alibaba-pai release or a converted ComfyUI copy, both "
                                      "load. Pair FL2VA with an fl2va UNET, Ref2VA with ref2va."}),
-            "nfe": (["8", "4", "6", "16", "32"],
+            "nfe": (["8", "4", "6"],
                     {"default": "8",
                      "tooltip": "Model evaluations (sampler steps). 8 = trained block size 4. "
-                                "4 regroups two blocks per step (faster, paper-sanctioned); "
-                                "6 uses the non-uniform default partition 8,8,4,4,4,4; "
-                                "16/32 use shorter blocks (features slightly off-distribution)."}),
+                                "4 regroups two blocks per step (faster, official); 6 uses the "
+                                "non-uniform default partition 8,8,4,4,4,4. Higher step counts "
+                                "are OFF the training envelope and render as noise."}),
             "lora_strength": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.01,
                                         "tooltip": "Trunk LoRA strength. Trained at 1.0."}),
             "head_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01,
@@ -197,9 +197,9 @@ class MiniMaxH3PDDAccApply:
             "partition": ("STRING", {"default": "",
                                      "tooltip": "Custom block sizes in fine steps, comma-separated, "
                                                 "summing to 32 (e.g. '8,8,4,4,4,4' = 6 steps, or "
-                                                "'8,4,4,4,4,4,4' = 7). Overrides nfe. Sizes 4 and 8 "
-                                                "on multiple-of-4 starts stay inside the "
-                                                "officially demonstrated envelope."}),
+                                                "'8,4,4,4,4,4,4' = 7). Overrides nfe. Only sizes 4 "
+                                                "and 8 are accepted — the trained envelope; other "
+                                                "sizes render as noise and are rejected."}),
         }}
 
     RETURN_TYPES = ("MODEL", "SIGMAS", "STRING")
@@ -283,7 +283,7 @@ class MiniMaxH3PDDAccScheduler:
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
-            "nfe": (["8", "4", "6", "16", "32"], {"default": "8"}),
+            "nfe": (["8", "4", "6"], {"default": "8"}),
             "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
                                   "tooltip": "Keep only the last round(steps*denoise) blocks "
                                              "(v2v-style partial denoise on the trained grid)."}),
