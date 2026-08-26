@@ -32,9 +32,11 @@ from .pdd_acc_core import (
     block_boundaries,
     fine_sigmas,
     fuse_heads,
+    rebase_adaln_to_curve,
     resolve_partition,
     select_block,
     split_pdd_state_dict,
+    table_sha,
 )
 
 WRAPPER_KEY = "minimax_h3_pdd_acc"
@@ -127,6 +129,46 @@ def _sigmas_tensor(bounds):
     return t
 
 
+def _curve_rebase_if_pruned(model, lora_sd, pdd_file):
+    """On a pruned (curve-form adaln) model, rebase the dense adaln LoRA modules
+    onto the model's curve basis. Returns (lora_sd, note) — note is "" on dense."""
+    dm = model.get_model_object("diffusion_model")
+    if not getattr(dm, "use_adaln_curves", False):
+        return lora_sd, ""
+    if not any(k.endswith(".adaln_proj.linear.lora_A.weight") for k in lora_sd):
+        return lora_sd, "pruned model, no adaln lora modules to rebase"
+
+    table = dm.adaln_t_table.detach().to(torch.float32).cpu()
+    basis_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adaln_basis")
+    from safetensors.torch import load_file as _load
+    match = None
+    seen = []
+    for name in sorted(os.listdir(basis_dir)) if os.path.isdir(basis_dir) else []:
+        if not name.startswith("basis_") or not name.endswith(".safetensors"):
+            continue
+        data = _load(os.path.join(basis_dir, name))
+        seen.append(name)
+        bt = data["adaln_t_table"]
+        if bt.shape == table.shape and torch.allclose(bt, table, atol=1e-6):
+            match = (name, data)
+            break
+    if match is None:
+        raise ValueError(
+            f"MiniMaxH3PDDAccApply: this model is PRUNED (curve-form adaln, table "
+            f"{list(table.shape)} sha {table_sha(table)}) but its adaln_t_table matches none of "
+            f"the shipped bases ({seen}). Bake one from a matching FULL checkpoint:\n"
+            f"  python3 bake_adaln_basis.py <full_ckpt> <table source> "
+            f"adaln_basis/basis_<name>.safetensors --trunk <name>")
+    name, data = match
+    trunk = name[len("basis_"):-len(".safetensors")]
+    if trunk not in pdd_file.lower():
+        logging.warning("MiniMaxH3PDDAccApply: model's adaln table is the %s trunk but the PDD "
+                        "file is %s — trunk mismatch? Pair FL2VA with fl2va, Ref2VA with ref2va.",
+                        trunk, pdd_file)
+    lora_sd, n = rebase_adaln_to_curve(lora_sd, data["c"], data["V"])
+    return lora_sd, f"pruned model: {n} adaln modules rebased onto the {trunk} curve basis"
+
+
 class MiniMaxH3PDDAccApply:
     @classmethod
     def INPUT_TYPES(cls):
@@ -178,15 +220,18 @@ class MiniMaxH3PDDAccApply:
         sizes = resolve_partition(num_steps, nfe, partition)
 
         # ---- trunk LoRA (normal quant-aware patch path) ----
-        expected_modules = sum(1 for k in lora_sd if k.endswith(".lora_A.weight"))
+        lora_sd, curve_note = _curve_rebase_if_pruned(model, lora_sd, pdd_file)
+        expected_keys = sum(1 for k in lora_sd
+                            if k.endswith((".lora_A.weight", ".diff", ".diff_b")))
+        expected_modules = sum(1 for k in lora_sd if k.endswith((".lora_A.weight", ".diff")))
         key_map = comfy.lora.model_lora_keys_unet(model.model, {})
         loaded = comfy.lora.load_lora(lora_sd, key_map)
 
         m = model.clone()
         applied = m.add_patches(loaded, lora_strength)
-        if len(applied) != expected_modules:
+        if len(applied) != expected_keys:
             raise ValueError(
-                f"MiniMaxH3PDDAccApply: only {len(applied)}/{expected_modules} LoRA modules "
+                f"MiniMaxH3PDDAccApply: only {len(applied)}/{expected_keys} LoRA patch keys "
                 f"matched the loaded model — is this a MiniMax-H3 UNET of the matching trunk?")
 
         # ---- head bank ----
@@ -218,7 +263,8 @@ class MiniMaxH3PDDAccApply:
             f"grid {num_steps} fine steps (trained block {config['block_size']}) -> "
             f"{len(sizes)} steps, blocks {','.join(map(str, sizes))}\n"
             f"lora: {expected_modules} modules @ strength {lora_strength} "
-            f"(alpha {config['alpha']})\n"
+            f"(alpha {config['alpha']})"
+            + (f"\n{curve_note}" if curve_note else "") + "\n"
             f"heads: video {list(vW.shape)}, audio {list(aW.shape)} fp32, "
             f"strength {head_strength}\n"
             f"sigmas: {', '.join(f'{s:.6f}' for s in bounds)}\n"

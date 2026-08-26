@@ -65,6 +65,20 @@ equals the Apply node's sigmas output.
 stack normally. **Do not stack** step-caching packs (blockcache / EasyCache — the final-layer
 patch fails closed, and an 8-step distill has nothing to cache anyway).
 
+## Pruned checkpoints
+
+Pruned H3 UNETs (Comfy-Org `*_pruned_*`, the GGUF/w4a8/nvfp4 re-quants of them) replace the
+dense adaln with a shared 8-dim curve table — a dense adaln LoRA can't patch them, which is
+why plain loaders spam ~50 `ERROR lora ... adaln_proj` lines and silently drop that part of
+the distill. This pack handles it: on a pruned model the 50 adaln LoRA modules are
+**rebased onto the model's curve basis** (weight diff `B(AV)` + the mandatory DC bias diff
+`B(Ac)`, from the affine fit `silu(t_emb(t)) ≈ c + V·table(t)` solved in float64 against a
+matching full checkpoint — fit residual ~1.4e-5, effectively exact). The two shipped bases in
+`adaln_basis/` cover every pruned release in the wild (exactly two adaln tables exist — one
+per trunk, byte-identical across Comfy-Org / w4a8 / fused repacks); the node matches the
+model's table automatically and warns on trunk mismatches. If a future release ships a new
+table, bake a basis with `bake_adaln_basis.py` (see its docstring).
+
 ## Example workflow
 
 [`example_workflows/pdd_acc_t2v_basic.json`](example_workflows/pdd_acc_t2v_basic.json) —

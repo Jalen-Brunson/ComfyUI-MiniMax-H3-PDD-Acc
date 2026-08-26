@@ -17,6 +17,7 @@ the LoRA already renamed to ComfyUI keys (diffusion_model.*.lora_A/B.weight
 + .alpha). Both formats load through split_pdd_state_dict().
 """
 
+import hashlib
 import re
 
 import torch
@@ -204,6 +205,46 @@ def convert_pdd_lora(sd, alpha):
 
     leftovers = set(sd.keys()) - consumed
     return out, leftovers
+
+
+# ---------------------------------------------------------------------------
+# pruned (curve-form adaln) support
+# ---------------------------------------------------------------------------
+
+def table_sha(table):
+    t = table.detach().to(torch.float32).contiguous().cpu()
+    return hashlib.sha256(str(tuple(t.shape)).encode() + t.numpy().tobytes()).hexdigest()[:16]
+
+
+def rebase_adaln_to_curve(lora_sd, c, V):
+    """Rewrite dense adaln LoRA modules as curve-form weight+bias diffs.
+
+    A pruned checkpoint's adaln consumes shared-table curve coordinates instead
+    of silu(t_emb(t)); with the affine basis silu(t_emb(t)) ~= c + V @ table(t)
+    (see bake_adaln_basis.py) the dense delta dW = scale*B@A becomes
+
+        weight diff  dW @ V = scale * B @ (A @ V)     [out, k]
+        bias   diff  dW @ c = scale * B @ (A @ c)     [out]   (DC term, mandatory)
+
+    contracted A-first so the [out, 2688] dense delta is never materialized.
+    Returns (new_lora_sd, num_rebased_modules).
+    """
+    out = dict(lora_sd)
+    c64 = c.to(torch.float64)
+    V64 = V.to(torch.float64)
+    n = 0
+    for k in list(out):
+        if not k.endswith(".adaln_proj.linear.lora_A.weight"):
+            continue
+        mod = k[: -len(".lora_A.weight")]
+        A = out.pop(mod + ".lora_A.weight").to(torch.float64)
+        B = out.pop(mod + ".lora_B.weight").to(torch.float64)
+        alpha = out.pop(mod + ".alpha", None)
+        scale = float(alpha) / A.shape[0] if alpha is not None else 1.0
+        out[mod + ".diff"] = (scale * (B @ (A @ V64))).to(torch.float32).contiguous()
+        out[mod + ".diff_b"] = (scale * (B @ (A @ c64))).to(torch.float32).contiguous()
+        n += 1
+    return out, n
 
 
 # ---------------------------------------------------------------------------

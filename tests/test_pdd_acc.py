@@ -32,6 +32,7 @@ from pdd_acc_core import (  # noqa: E402
     convert_pdd_lora,
     fine_sigmas,
     fuse_heads,
+    rebase_adaln_to_curve,
     resolve_partition,
     select_block,
     shifted_sigma,
@@ -330,6 +331,72 @@ def test_split_both_formats_roundtrip():
         assert torch.equal(lora1[k], lora2[k]), k
     for a, b in zip(heads1, heads2):
         assert torch.equal(a, b)
+
+
+def test_curve_rebase_equivalence():
+    # Build a synthetic "dense curve" u(t) that is exactly affine in a rank-k
+    # table (how real pruned checkpoints were made), rebase a random adaln
+    # lora, and check dense modulation delta == curve delta at every knot.
+    torch.manual_seed(5)
+    rows, k, dense_in, out_dim, r = 65, 5, 12, 20, 3
+    mean = torch.randn(dense_in, dtype=torch.float64)
+    G = torch.randn(rows, k, dtype=torch.float64)        # the table
+    H = torch.randn(k, dense_in, dtype=torch.float64)
+    u = mean + G @ H                                     # u_j = mean + H^T @ table_j
+
+    # solve the affine basis the same way bake_adaln_basis.py does
+    X = torch.cat([torch.ones(rows, 1, dtype=torch.float64), G], dim=1)
+    sol = torch.linalg.lstsq(X, u).solution
+    c, V = sol[0], sol[1:].T                             # [dense_in], [dense_in, k]
+
+    A = torch.randn(r, dense_in)
+    B = torch.randn(out_dim, r)
+    sd = {"diffusion_model.blocks.0.adaln_proj.linear.lora_A.weight": A,
+          "diffusion_model.blocks.0.adaln_proj.linear.lora_B.weight": B,
+          "diffusion_model.blocks.0.adaln_proj.linear.alpha": torch.tensor(float(2 * r)),
+          "diffusion_model.blocks.0.attn.out_proj.lora_A.weight": torch.zeros(r, 4),
+          "diffusion_model.blocks.0.attn.out_proj.lora_B.weight": torch.zeros(4, r),
+          "diffusion_model.blocks.0.attn.out_proj.alpha": torch.tensor(1.0)}
+    out, n = rebase_adaln_to_curve(sd, c, V)
+    assert n == 1
+    assert "diffusion_model.blocks.0.attn.out_proj.lora_A.weight" in out  # untouched
+    assert not any("adaln" in key and "lora" in key for key in out)
+    dW8 = out["diffusion_model.blocks.0.adaln_proj.linear.diff"].double()
+    db = out["diffusion_model.blocks.0.adaln_proj.linear.diff_b"].double()
+    assert dW8.shape == (out_dim, k) and db.shape == (out_dim,)
+
+    scale = 2.0                                          # alpha 2r / rank r
+    dW = scale * (B.double() @ A.double())
+    for j in (0, 1, rows // 2, rows - 1):
+        dense = dW @ u[j]
+        curve = dW8 @ G[j] + db
+        assert torch.allclose(dense, curve, atol=1e-5), j
+        # dropping the DC term must break it
+        assert not torch.allclose(dense, dW8 @ G[j], atol=1e-3)
+
+
+def test_shipped_adaln_bases():
+    from safetensors import safe_open
+    basis_dir = os.path.join(PACK, "adaln_basis")
+    if not os.path.isdir(basis_dir):
+        SKIP.append("shipped_adaln_bases (dir missing)")
+        return
+    tables = {}
+    for trunk in ("fl2va", "ref2va"):
+        p = os.path.join(basis_dir, f"basis_{trunk}.safetensors")
+        assert os.path.exists(p), p
+        with safe_open(p, framework="pt") as f:
+            meta = f.metadata()
+            c = f.get_tensor("c")
+            V = f.get_tensor("V")
+            table = f.get_tensor("adaln_t_table")
+        assert c.shape == (2688,) and V.shape == (2688, 8), (c.shape, V.shape)
+        assert table.shape == (1025, 8)
+        assert float(meta["residual"]) < 5e-3, meta["residual"]
+        assert meta["trunk"] == trunk
+        tables[trunk] = table
+    # the two trunks carry genuinely different tables
+    assert not torch.allclose(tables["fl2va"], tables["ref2va"], atol=1e-4)
 
 
 def test_real_file_full_convert():
