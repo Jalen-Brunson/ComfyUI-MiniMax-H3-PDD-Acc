@@ -40,10 +40,16 @@ chunked samplers, resumes and split schedules can't desync it.
   per step (officially sanctioned — the release demos both). `6` uses the non-uniform default
   partition `8,8,4,4,4,4` (the two merged size-8 blocks sit at high sigma where the block
   boundaries span almost no sigma, and the late heavyweight blocks stay at trained size —
-  every knot stays on the trained fine grid). `16`/`32` use shorter blocks.
+  every knot stays on the trained fine grid).
 - **partition** (optional) — custom block sizes in fine steps, comma-separated, summing to 32
-  (e.g. `8,4,4,4,4,4,4` for 7 steps). Overrides `nfe`; the sigmas output follows. Sizes 4 and 8
-  on multiple-of-4 starts stay inside the officially demonstrated envelope.
+  (e.g. `8,4,4,4,4,4,4` for 7 steps). Overrides `nfe`; the sigmas output follows.
+- **Only block sizes 4 and 8 are legal** — the training envelope. PDD heads are conditioned on
+  trunk features from block *starts* on the L_min=4 grid with blocks of 4 or 8 fine steps;
+  evaluating the trunk anywhere else feeds the heads features they never trained on and renders
+  as heavy noise (community-reported at 32 steps on FL2VA, reproduced locally on plain SDPA —
+  it is not an attention-backend issue). The node therefore rejects off-envelope step counts
+  and partitions instead of letting them degrade. More steps than 8 is not "closer to the
+  teacher" here: the per-interval heads are only ever decoded from envelope block starts.
 - **lora_strength / head_strength** — trained at 1.0 / 1.0.
 - **on_off_grid** — `error` (default): refuse evaluation at sigmas that are not trained block
   boundaries, with a message telling you what to fix. `clamp`: nearest block, degraded output.
