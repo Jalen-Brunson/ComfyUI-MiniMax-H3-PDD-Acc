@@ -13,13 +13,13 @@ trained for in diffusers. Sign convention is handled by core's own negation of
 the final-layer outputs.
 """
 
+import inspect
 import logging
 import math
 import os
 from types import SimpleNamespace
 
 import torch
-import torch.nn.functional as F
 
 import comfy.lora
 import comfy.patcher_extension
@@ -29,12 +29,14 @@ import folder_paths
 from .pdd_acc_core import (
     AUDIO_SHIFT,
     VIDEO_SHIFT,
+    HeadBank,
     block_boundaries,
     fine_sigmas,
     fuse_heads,
+    make_pdd_final_forward,
     rebase_adaln_to_curve,
+    refit_adaln_basis,
     resolve_partition,
-    select_block,
     split_pdd_state_dict,
     table_sha,
     warmup_schedule,
@@ -47,20 +49,21 @@ os.makedirs(_pdd_dir, exist_ok=True)
 folder_paths.add_model_folder_path("pdd_acc", _pdd_dir, is_default=True)
 
 
-class HeadBank:
-    def __init__(self, vw, vb, aw, ab):
-        self.cpu = (vw, vb, aw, ab)
-        self._cache = {}
-
-    def for_device(self, device):
-        d = torch.device(device)
-        if d.type == "cpu":
-            return self.cpu
-        got = self._cache.get(d)
-        if got is None:
-            got = tuple(t.to(d) for t in self.cpu)
-            self._cache[d] = got
-        return got
+def _check_core_supported():
+    """Fail closed on ComfyUI cores that predate the MiniMax-H3 carried-audio
+    rework (#15243): heads emit mean block velocities and rely on core's
+    carried-variable audio mapping — the older stock-world mechanics would
+    silently mis-integrate audio."""
+    try:
+        from comfy.ldm.minimax.model import MiniMaxH3Model
+        src = inspect.getsource(MiniMaxH3Model.forward)
+    except Exception:
+        return  # can't probe (source unavailable) — don't block on that alone
+    if "audio_scale" not in src:
+        raise RuntimeError(
+            "MiniMaxH3PDDAccApply: this ComfyUI predates the MiniMax-H3 audio-mechanics rework "
+            "(comfyanonymous/ComfyUI#15243), so the PDD heads would mis-integrate audio. "
+            "Update ComfyUI to v0.33.0 or newer.")
 
 
 def make_wrapper(holder):
@@ -89,40 +92,6 @@ def make_wrapper(holder):
     return pdd_acc_wrapper
 
 
-def make_pdd_final_forward(final_layer, heads, holder, bounds, on_off_grid, strength):
-    from comfy.ldm.minimax.model import _mod_row
-
-    def pdd_final_forward(self, x, t_emb, video_seg, audio_seg):
-        # line-for-line FinalLayer.forward through the fp32 casts; only the two
-        # projections are replaced by the armed per-block fused heads
-        if holder.sigma_v is None:
-            raise RuntimeError(
-                "MiniMaxH3PDDAccApply: final-layer patch invoked without active diffusion-call "
-                "state. Do not stack caching packs (T8 blockcache / EasyCache / Spectrum) on a "
-                "PDD-patched model.")
-        blk = select_block(holder.sigma_v, bounds, on_off_grid)
-        shift, scale = self.adaln_proj(t_emb)
-
-        def mod(seg):
-            a, b, row = seg
-            return (self.norm(x[a:b]) * (1.0 + _mod_row(scale, row, scale.dtype))
-                    + _mod_row(shift, row, shift.dtype)).to(torch.float32)
-
-        hv = mod(video_seg)
-        ha = mod(audio_seg)
-        vW, vB, aW, aB = heads.for_device(hv.device)
-        v = F.linear(hv, vW[blk], vB[blk])
-        a = F.linear(ha, aW[blk], aB[blk])
-        if strength != 1.0:
-            nv = self.video_out(hv)
-            na = self.audio_out(ha)
-            v = nv + (v - nv) * strength
-            a = na + (a - na) * strength
-        return v, a
-
-    return pdd_final_forward.__get__(final_layer, final_layer.__class__)
-
-
 def _sigmas_tensor(bounds):
     t = torch.tensor(bounds, dtype=torch.float32)
     t[0] = 1.0
@@ -144,6 +113,7 @@ def _curve_rebase_if_pruned(model, lora_sd, pdd_file):
     from safetensors.torch import load_file as _load
     match = None
     seen = []
+    candidates = []
     for name in sorted(os.listdir(basis_dir)) if os.path.isdir(basis_dir) else []:
         if not name.startswith("basis_") or not name.endswith(".safetensors"):
             continue
@@ -151,23 +121,49 @@ def _curve_rebase_if_pruned(model, lora_sd, pdd_file):
         seen.append(name)
         bt = data["adaln_t_table"]
         if bt.shape == table.shape and torch.allclose(bt, table, atol=1e-6):
-            match = (name, data)
+            match = (name, data["c"], data["V"], "")
             break
+        candidates.append((name, data))
     if match is None:
-        raise ValueError(
-            f"MiniMaxH3PDDAccApply: this model is PRUNED (curve-form adaln, table "
-            f"{list(table.shape)} sha {table_sha(table)}) but its adaln_t_table matches none of "
-            f"the shipped bases ({seen}). Bake one from a matching FULL checkpoint:\n"
-            f"  python3 bake_adaln_basis.py <full_ckpt> <table source> "
-            f"adaln_basis/basis_<name>.safetensors --trunk <name>")
-    name, data = match
+        # Not a byte-identical table. The same trunk's curve can be carried by a
+        # different (affinely equivalent, or merely re-rounded) table in a
+        # repacked / requantized pruned build — every table samples the same
+        # fixed timestep grid, so refit each shipped basis onto this table and
+        # accept the best fit if its residual is same-trunk small (known-good
+        # equivalence fits are ~1e-5; a different trunk lands around 1e-1).
+        fits = []
+        for name, data in candidates:
+            if data["adaln_t_table"].shape[0] != table.shape[0]:
+                continue
+            c2, V2, rel = refit_adaln_basis(data["c"], data["V"], data["adaln_t_table"], table)
+            fits.append((rel, name, c2, V2))
+        fits.sort(key=lambda f: f[0])
+        if fits and fits[0][0] < 5e-3:
+            rel, name, c2, V2 = fits[0]
+            match = (name, c2, V2, f", auto-refit onto its table (residual {rel:.2e})")
+            logging.info("MiniMaxH3PDDAccApply: model's adaln_t_table (sha %s) is not "
+                         "byte-identical to %s but is curve-equivalent — basis auto-refit, "
+                         "residual %.2e", table_sha(table), name, rel)
+        else:
+            detail = "; ".join(f"{n}: refit residual {r:.2e}" for r, n, _, _ in fits) \
+                     or "no shape-compatible shipped basis"
+            raise ValueError(
+                f"MiniMaxH3PDDAccApply: this model is PRUNED (curve-form adaln, table "
+                f"{list(table.shape)} sha {table_sha(table)}) but its adaln_t_table matches none "
+                f"of the shipped bases ({seen}; {detail}) — it looks like a different finetune, "
+                f"not a repack of a known trunk. Bake a basis from a matching FULL checkpoint:\n"
+                f"  python3 bake_adaln_basis.py <full_ckpt> <table source> "
+                f"adaln_basis/basis_<name>.safetensors --trunk <name>\n"
+                f"or open an issue naming the exact checkpoint file/source so a basis can be "
+                f"shipped.")
+    name, c, V, extra = match
     trunk = name[len("basis_"):-len(".safetensors")]
     if trunk not in pdd_file.lower():
         logging.warning("MiniMaxH3PDDAccApply: model's adaln table is the %s trunk but the PDD "
                         "file is %s — trunk mismatch? Pair FL2VA with fl2va, Ref2VA with ref2va.",
                         trunk, pdd_file)
-    lora_sd, n = rebase_adaln_to_curve(lora_sd, data["c"], data["V"])
-    return lora_sd, f"pruned model: {n} adaln modules rebased onto the {trunk} curve basis"
+    lora_sd, n = rebase_adaln_to_curve(lora_sd, c, V)
+    return lora_sd, f"pruned model: {n} adaln modules rebased onto the {trunk} curve basis{extra}"
 
 
 class MiniMaxH3PDDAccApply:
@@ -201,6 +197,14 @@ class MiniMaxH3PDDAccApply:
                                                 "'8,4,4,4,4,4,4' = 7). Overrides nfe. Only sizes 4 "
                                                 "and 8 are accepted — the trained envelope; other "
                                                 "sizes render as noise and are rejected."}),
+            "enabled": ("BOOLEAN", {"default": True,
+                                    "tooltip": "False = full bypass: the input model and "
+                                               "bypass_sigmas pass through untouched (nothing is "
+                                               "loaded or patched). Wire bypass_sigmas with the "
+                                               "schedule for the un-distilled model."}),
+            "bypass_sigmas": ("SIGMAS", {"tooltip": "Returned as the sigmas output when "
+                                                    "enabled=False (e.g. a BasicScheduler for the "
+                                                    "base model). Ignored when enabled."}),
         }}
 
     RETURN_TYPES = ("MODEL", "SIGMAS", "STRING")
@@ -212,7 +216,19 @@ class MiniMaxH3PDDAccApply:
                    "sigmas output to SamplerCustomAdvanced and sample with euler, CFG 1.0, "
                    "SigmaShift 12/3. Remove other distill LoRAs (turbo) and cache nodes.")
 
-    def apply(self, model, pdd_file, nfe, lora_strength, head_strength, on_off_grid, partition=""):
+    def apply(self, model, pdd_file, nfe, lora_strength, head_strength, on_off_grid, partition="",
+              enabled=True, bypass_sigmas=None):
+        if not enabled:
+            if bypass_sigmas is None:
+                raise ValueError(
+                    "MiniMaxH3PDDAccApply: enabled=False needs bypass_sigmas wired (the schedule "
+                    "for the un-distilled model) — the PDD block-boundary sigmas would be wrong "
+                    "for an unpatched model.")
+            return (model, bypass_sigmas,
+                    "PDD Acc BYPASSED (enabled=False): model and bypass_sigmas passed through "
+                    "unchanged. Remember the un-distilled recipe (CFG, sampler, steps) differs "
+                    "from the PDD one.")
+        _check_core_supported()
         nfe = int(nfe)
         path = folder_paths.get_full_path_or_raise("pdd_acc", pdd_file)
         sd, metadata = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
@@ -250,7 +266,7 @@ class MiniMaxH3PDDAccApply:
         heads = HeadBank(vW, vB, aW, aB)
         bounds = block_boundaries(num_steps, sizes)
 
-        holder = SimpleNamespace(sigma_v=None)
+        holder = SimpleNamespace(sigma_v=None, blk=None)
         m.add_object_patch(
             "diffusion_model.final_layer.forward",
             make_pdd_final_forward(final_layer, heads, holder, bounds, on_off_grid, head_strength))

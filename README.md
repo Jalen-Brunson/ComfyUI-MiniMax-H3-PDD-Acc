@@ -28,6 +28,11 @@ Either release works — the loader auto-detects the format:
 Pair **FL2VA** with an fl2va UNET and **Ref2VA** with a ref2va UNET (bf16 originals or int8
 convrot builds both work — LoRA application goes through ComfyUI's quant-aware patch path).
 
+**ComfyUI version:** v0.33.0 or newer (the MiniMax-H3 carried-audio mechanics,
+comfyanonymous/ComfyUI#15243 — the node fails closed with an update message on older cores).
+Both pre- and post-#15375 cores work; the final-layer patch delegates to your core's own
+forward rather than replicating its internals.
+
 ## Nodes
 
 ### MiniMax H3 PDD Acc LoRA (Apply) — `MiniMaxH3PDDAccApply`
@@ -53,6 +58,14 @@ chunked samplers, resumes and split schedules can't desync it.
 - **lora_strength / head_strength** — trained at 1.0 / 1.0.
 - **on_off_grid** — `error` (default): refuse evaluation at sigmas that are not trained block
   boundaries, with a message telling you what to fix. `clamp`: nearest block, degraded output.
+- **enabled** (optional, default true) — `false` = full bypass: the input model and
+  `bypass_sigmas` pass through untouched (nothing is loaded or patched). Wire a boolean node
+  here to A/B the distill or drive a subgraph toggle.
+- **bypass_sigmas** (optional SIGMAS) — returned as the sigmas output when `enabled=false`
+  (wire the schedule for the un-distilled model, e.g. a BasicScheduler). The node errors if
+  you disable it without wiring this — the PDD block boundaries would be a wrong schedule for
+  an unpatched model. Remember the rest of the un-distilled recipe (CFG, sampler, steps)
+  differs too.
 
 ### MiniMax H3 PDD Acc Scheduler — `MiniMaxH3PDDAccScheduler`
 Standalone SIGMAS emitter for partial-denoise / split-sigma workflows. At `denoise 1.0` it
@@ -79,11 +92,19 @@ why plain loaders spam ~50 `ERROR lora ... adaln_proj` lines and silently drop t
 the distill. This pack handles it: on a pruned model the 50 adaln LoRA modules are
 **rebased onto the model's curve basis** (weight diff `B(AV)` + the mandatory DC bias diff
 `B(Ac)`, from the affine fit `silu(t_emb(t)) ≈ c + V·table(t)` solved in float64 against a
-matching full checkpoint — fit residual ~1.4e-5, effectively exact). The two shipped bases in
-`adaln_basis/` cover every pruned release in the wild (exactly two adaln tables exist — one
-per trunk, byte-identical across Comfy-Org / w4a8 / fused repacks); the node matches the
-model's table automatically and warns on trunk mismatches. If a future release ships a new
-table, bake a basis with `bake_adaln_basis.py` (see its docstring).
+matching full checkpoint — fit residual ~1.4e-5, effectively exact). The node matches the
+model's adaln table against the two shipped bases in `adaln_basis/` (one per trunk)
+automatically and warns on trunk mismatches.
+
+A repacked or requantized pruned build may carry a table that is **not byte-identical** to
+the Comfy-Org ones but still describes the same trunk's curve. The node handles that too:
+when no exact match is found it **auto-refits** each shipped basis onto the model's table
+(rows of every table sample the same fixed timestep grid, so this is a float64 least-squares
+fit) and accepts the best fit when the residual is same-trunk small (~1e-5; a genuinely
+different finetune lands around 1e-1 and is refused). If your pruned checkpoint is refused,
+it is not a repack of a known trunk — bake a basis with `bake_adaln_basis.py` (see its
+docstring) or open an issue naming the exact checkpoint file/source so a basis can be
+shipped.
 
 ## Example workflow
 
