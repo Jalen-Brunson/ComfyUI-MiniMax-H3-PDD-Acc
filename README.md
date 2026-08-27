@@ -106,11 +106,16 @@ it is not a repack of a known trunk — bake a basis with `bake_adaln_basis.py` 
 docstring) or open an issue naming the exact checkpoint file/source so a basis can be
 shipped.
 
-## Example workflow
+## Example workflows
 
-[`example_workflows/pdd_acc_t2v_basic.json`](example_workflows/pdd_acc_t2v_basic.json) —
-prompt-to-video+audio in 8 steps (Ref2VA trunk, zero references; wire images into
-`ref_image_0…` for identity-locked r2v). Drag into ComfyUI.
+- [`example_workflows/pdd_acc_t2v_basic.json`](example_workflows/pdd_acc_t2v_basic.json) —
+  prompt-to-video+audio in 8 steps (Ref2VA trunk, zero references; wire images into
+  `ref_image_0…` for identity-locked r2v). Drag into ComfyUI.
+- [`example_workflows/pdd_acc_t2v_warmup_split.json`](example_workflows/pdd_acc_t2v_warmup_split.json) —
+  two-phase warmup for better reference likeness: the Warmup Scheduler's sigmas are split at
+  its `phase2_start_step` with core `SplitSigmas`; pass 1 samples the un-distilled BASE model
+  over the warmup segment, pass 2 chains its `output` latent (via `DisableNoise`) into the
+  PDD-patched model for the trained tail.
 
 ## Converter (optional)
 
