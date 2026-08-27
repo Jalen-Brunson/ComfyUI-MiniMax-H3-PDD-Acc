@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import torch
 
 import comfy.lora
+import comfy.nested_tensor
 import comfy.patcher_extension
 import comfy.utils
 import folder_paths
@@ -414,14 +415,64 @@ class MiniMaxH3PDDAccWarmupScheduler:
         return (_sigmas_tensor(sigmas), p2, info)
 
 
+class MiniMaxH3AVLatentUpscaleBy:
+    """Spatial upscale for the MiniMax-H3 nested AV latent (video half only).
+
+    Core LatentUpscale(By) cannot handle the nested video+audio pair. The video
+    latent is resized per frame; the audio latent passes through untouched. New
+    latent dims snap to even (the model packs 2x2 spatial patches), i.e. pixel
+    dims stay on the 32px grid.
+    """
+
+    upscale_methods = ["bislerp", "bicubic", "bilinear", "nearest-exact", "area"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "samples": ("LATENT",),
+            "upscale_method": (cls.upscale_methods,),
+            "scale_by": ("FLOAT", {"default": 1.5, "min": 0.25, "max": 4.0, "step": 0.05,
+                                   "tooltip": "1.5 on a 896x512 pass-1 render lands exactly on "
+                                              "the model-native 1344x768."}),
+        }}
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "upscale"
+    CATEGORY = "model/latent/minimax"
+    DESCRIPTION = ("Upscales the video half of a MiniMax-H3 AV latent (audio untouched) for "
+                   "two-pass latent-upscale workflows: full PDD pass at low res -> this node -> "
+                   "partial-denoise PDD pass (MiniMaxH3PDDAccScheduler with denoise < 1.0).")
+
+    def upscale(self, samples, upscale_method, scale_by):
+        nt = samples["samples"]
+        if not getattr(nt, "is_nested", False) or len(nt.tensors) != 2 \
+                or nt.tensors[0].ndim != 5:
+            raise ValueError(
+                "MiniMaxH3AVLatentUpscaleBy: expected a MiniMax-H3 AV latent (nested "
+                "video+audio pair, e.g. from a MiniMax H3 conditioning node or sampler).")
+        video, audio = nt.tensors
+        b, c, t, h, w = video.shape
+        nh = max(2, round(h * scale_by / 2) * 2)
+        nw = max(2, round(w * scale_by / 2) * 2)
+        vid = video.movedim(2, 1).reshape(b * t, c, h, w)
+        vid = comfy.utils.common_upscale(vid, nw, nh, upscale_method, "disabled")
+        vid = vid.reshape(b, t, c, nh, nw).movedim(1, 2)
+        s = samples.copy()
+        s.pop("noise_mask", None)   # sized for the old resolution
+        s["samples"] = comfy.nested_tensor.NestedTensor((vid, audio))
+        return (s,)
+
+
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3PDDAccApply": MiniMaxH3PDDAccApply,
     "MiniMaxH3PDDAccScheduler": MiniMaxH3PDDAccScheduler,
     "MiniMaxH3PDDAccWarmupScheduler": MiniMaxH3PDDAccWarmupScheduler,
+    "MiniMaxH3AVLatentUpscaleBy": MiniMaxH3AVLatentUpscaleBy,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3PDDAccApply": "MiniMax H3 PDD Acc LoRA (Apply)",
     "MiniMaxH3PDDAccScheduler": "MiniMax H3 PDD Acc Scheduler",
     "MiniMaxH3PDDAccWarmupScheduler": "MiniMax H3 PDD Acc Warmup Scheduler (2-phase)",
+    "MiniMaxH3AVLatentUpscaleBy": "MiniMax H3 AV Latent Upscale By",
 }

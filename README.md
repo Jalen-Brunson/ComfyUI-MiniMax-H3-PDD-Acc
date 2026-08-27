@@ -143,6 +143,15 @@ blaming settings.
   its `phase2_start_step` with core `SplitSigmas`; pass 1 samples the un-distilled BASE model
   over the warmup segment, pass 2 chains its `output` latent (via `DisableNoise`) into the
   PDD-patched model for the trained tail.
+- [`example_workflows/pdd_acc_t2v_latent_upscale.json`](example_workflows/pdd_acc_t2v_latent_upscale.json) —
+  two-pass latent upscale (hi-res fix): full 8-step PDD render at 896x512, then
+  `MiniMax H3 AV Latent Upscale By` x1.5 (lands exactly on the model-native 1344x768) into a
+  partial-denoise PDD pass — the `PDD Acc Scheduler` with `denoise 0.25` re-runs only the
+  LAST 2 trained blocks (resume sigma 0.8), so the refine stays on the trained grid
+  (0.125 = 1 block/subtle, 0.375 = 3 blocks/strong). Audio is decoded from pass 1 and is
+  untouched by the refine. The upscale node exists because core `LatentUpscale` cannot
+  handle H3's nested video+audio latent; it resizes the video half per frame (audio passes
+  through) and snaps to the model's 2x2 patch grid.
 
 ## Converter (optional)
 

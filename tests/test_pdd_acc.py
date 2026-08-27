@@ -751,6 +751,44 @@ def test_shipped_partition_fingerprints():
         assert dists[t] < 1e-3, f"self-distance {dists[t]} too large"
 
 
+def test_av_latent_upscale_node():
+    try:
+        import comfy.nested_tensor
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "minimax_h3_pdd_acc_testpkg2", os.path.join(PACK, "__init__.py"),
+            submodule_search_locations=[PACK])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules["minimax_h3_pdd_acc_testpkg2"] = pkg
+        spec.loader.exec_module(pkg)
+    except Exception as e:
+        SKIP.append(f"av_latent_upscale (comfy not importable: {type(e).__name__})")
+        return
+    node = pkg.NODE_CLASS_MAPPINGS["MiniMaxH3AVLatentUpscaleBy"]()
+    torch.manual_seed(13)
+    video = torch.randn(1, 24, 7, 32, 56)      # 896x512 -> latent 56x32
+    audio = torch.randn(1, 32, 2, 88)
+    latent = {"samples": comfy.nested_tensor.NestedTensor((video, audio)),
+              "noise_mask": torch.ones(1, 1, 7, 32, 56), "extra": "kept"}
+    (out,) = node.upscale(latent, "bicubic", 1.5)
+    v2, a2 = out["samples"].tensors
+    assert tuple(v2.shape) == (1, 24, 7, 48, 84), f"got {tuple(v2.shape)}"   # 1344x768
+    assert torch.equal(a2, audio), "audio half must pass through untouched"
+    assert "noise_mask" not in out and out["extra"] == "kept"
+    # odd result snaps to even (2x2 spatial patches)
+    (out2,) = node.upscale({"samples": comfy.nested_tensor.NestedTensor((video, audio))},
+                           "bilinear", 1.4)
+    assert all(s % 2 == 0 for s in out2["samples"].tensors[0].shape[-2:])
+    # input latent unchanged (copy semantics)
+    assert torch.equal(latent["samples"].tensors[0], video)
+    # a plain (non-nested) latent is refused
+    try:
+        node.upscale({"samples": torch.randn(1, 4, 32, 56)}, "bicubic", 1.5)
+        raise AssertionError("plain latent should be refused")
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:
