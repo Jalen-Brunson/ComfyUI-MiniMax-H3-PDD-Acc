@@ -27,13 +27,17 @@ sys.path.insert(0, PACK)
 import reference_minimax_h3_pdd as ref  # noqa: E402
 from pdd_acc_core import (  # noqa: E402
     AUDIO_SHIFT,
+    PARTITION_TOLERANCE,
     VIDEO_SHIFT,
     HeadBank,
     block_boundaries,
+    check_partition_pairing,
     convert_pdd_lora,
     fine_sigmas,
     fuse_heads,
+    identify_trunk,
     make_pdd_final_forward,
+    partition_from_name,
     rebase_adaln_to_curve,
     refit_adaln_basis,
     resolve_partition,
@@ -646,6 +650,105 @@ def test_apply_bypass():
         raise AssertionError("bypass without bypass_sigmas should raise")
     except ValueError:
         pass
+
+
+class _PR15908FinalLayer(_PreModRowFinalLayer):
+    """FinalLayer with the shape core PR #15908 proposes: a widened forward
+    signature AND an n-head probe that reads video_out.weight/out_features
+    BEFORE calling the projections. Our swapped-in head modules must expose the
+    NATIVE attributes so the probe computes n == 1 and takes the stock path."""
+
+    def forward(self, x, t_emb, video_seg, audio_seg, sigma, sample_sigmas, shifts):
+        n = self.video_out.weight.shape[0] // self.video_out.out_features
+        assert n == 1, f"probe saw fused-checkpoint head (n={n}) through the swap"
+        assert self.video_out.bias is not None and self.video_out.in_features > 0
+        return super().forward(x, t_emb, video_seg, audio_seg)
+
+
+def test_head_swap_survives_pr15908_probe():
+    from types import SimpleNamespace
+    torch.manual_seed(11)
+    fl = _PR15908FinalLayer(16, 6, 3)
+    x = torch.randn(10, 16)
+    t_emb, vseg, aseg = torch.randn(2, 8), (0, 7, 0), (7, 10, 1)
+    extra = (0.5, torch.linspace(1, 0, 9), (12.0, 3.0))   # sigma, sample_sigmas, shifts
+    native = fl(x, t_emb, vseg, aseg, *extra)
+    sizes = (4,) * 8
+    bounds = block_boundaries(32, sizes)
+    vW, vB, aW, aB = _native_stacked_bank(fl, 8)
+    vW[3] += 1.0
+    heads = HeadBank(vW, vB, aW, aB)
+    holder = SimpleNamespace(sigma_v=None, blk=None)
+    patched = make_pdd_final_forward(fl, heads, holder, bounds, "error", 1.0)
+    # extra positional args must reach the widened forward untouched
+    holder.sigma_v = bounds[0]
+    v, a = patched(x, t_emb, vseg, aseg, *extra)
+    assert torch.allclose(v, native[0], atol=1e-6) and torch.allclose(a, native[1], atol=1e-6)
+    holder.sigma_v = bounds[3]
+    v3, _ = patched(x, t_emb, vseg, aseg, *extra)
+    assert not torch.allclose(v3, native[0], atol=1e-4), "armed head must reach the output"
+
+
+def test_partition_helpers():
+    assert partition_from_name("MiniMax-H3-FL2VA-Acc-8Step.safetensors") == "fl2va"
+    assert partition_from_name("MiniMax-H3-Ref2VA-Acc-8Step.safetensors") == "ref2va"
+    assert partition_from_name("minimax_h3_fl2va_pdd_acc_8step_comfyui.safetensors") == "fl2va"
+    assert partition_from_name(None, "", "no_trunk_here.safetensors") is None
+    assert partition_from_name("fl2va_vs_ref2va_merge.safetensors") is None  # ambiguous
+    assert partition_from_name(None, "ref2va", "ignored_fl2va") == "ref2va"  # first hit wins
+
+    torch.manual_seed(12)
+    fp_a = torch.randn(8, 16)
+    fp_b = fp_a + 0.05 * fp_a.norm() / math.sqrt(fp_a.numel()) * torch.randn(8, 16) * 4
+    assert float((fp_a - fp_b).norm() / fp_a.norm()) > 2 * PARTITION_TOLERANCE
+    fps = {"fl2va": fp_a.half(), "ref2va": fp_b.half()}
+    live = fp_a + 1e-3 * torch.randn(8, 16)   # cast-scale noise
+    trunk, dists = identify_trunk(live, fps)
+    assert trunk == "fl2va" and dists["fl2va"] < PARTITION_TOLERANCE
+
+    ok = check_partition_pairing(live, fps, "fl2va", "f.safetensors")
+    assert ok.startswith("partition check ok")
+    try:
+        check_partition_pairing(live, fps, "ref2va", "f.safetensors")
+        raise AssertionError("confident mismatch must raise")
+    except ValueError as e:
+        assert "silently wrong" in str(e)
+    warned = check_partition_pairing(live, fps, "ref2va", "f.safetensors", mode="warn")
+    assert "MISMATCH" in warned
+    far = torch.randn(8, 16) * 10
+    assert "INCONCLUSIVE" in check_partition_pairing(far, fps, "fl2va", "f")
+    assert "INCONCLUSIVE" in check_partition_pairing(live, fps, None, "f")
+    assert "skipped" in check_partition_pairing(live, {}, "fl2va", "f")
+
+
+def test_shipped_partition_fingerprints():
+    fp_dir = os.path.join(PACK, "partition_fingerprints")
+    paths = {t: os.path.join(fp_dir, f"video_out_{t}.safetensors")
+             for t in ("fl2va", "ref2va")}
+    if not all(os.path.exists(p) for p in paths.values()):
+        SKIP.append("shipped_partition_fingerprints (files absent)")
+        return
+    from safetensors import safe_open
+    fps = {}
+    for t, p in paths.items():
+        with safe_open(p, framework="pt") as f:
+            fps[t] = f.get_tensor("video_out_weight")
+            assert f.metadata()["partition"] == t
+    gap = float((fps["fl2va"].float() - fps["ref2va"].float()).norm()
+                / fps["ref2va"].float().norm())
+    assert gap > 0.04, f"trunk gap {gap} suspiciously small"
+    # against the real checkpoints when present
+    ckpts = {"fl2va": UNET_FILE,
+             "ref2va": UNET_FILE.replace("fl2va", "ref2va")}
+    for t, ck in ckpts.items():
+        if not os.path.exists(ck):
+            SKIP.append(f"fingerprint vs real checkpoint ({t} absent)")
+            continue
+        with safe_open(ck, framework="pt") as f:
+            live = f.get_tensor("final_layer.video_out.weight")
+        got, dists = identify_trunk(live, fps)
+        assert got == t, f"{ck} identified as {got} ({dists})"
+        assert dists[t] < 1e-3, f"self-distance {dists[t]} too large"
 
 
 if __name__ == "__main__":

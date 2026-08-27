@@ -84,6 +84,23 @@ equals the Apply node's sigmas output.
 stack normally. **Do not stack** step-caching packs (blockcache / EasyCache — the final-layer
 patch fails closed, and an 8-step distill has nothing to cache anyway).
 
+## Trunk pairing guard (partition fingerprint)
+
+The FL2VA and Ref2VA trunks ship **identical tensor key sets**, so pairing an FL2VA distill
+with a ref2va UNET (or vice versa) applies cleanly and renders **silently wrong**. The Apply
+node now identifies the loaded model's trunk from its `final_layer.video_out.weight` — that
+tensor is fp32-unquantized in every published build, bit-identical across the
+int8_convrot/pruned/rebased variants of one trunk, and the two trunks sit 0.0503 apart in
+relative Frobenius distance (fingerprints shipped fp16 in `partition_fingerprints/`,
+tolerance 0.015 ≫ cast/storage noise ~2e-3). A confident mismatch **errors**; set the
+optional `partition_check` input to `warn` for deliberate cross-trunk experiments. A
+finetune or full-merge that matches neither fingerprint just logs "inconclusive" and
+proceeds — the guard never blocks checkpoints it has no fingerprint for. New trunks:
+`python3 bake_partition_fingerprint.py <checkpoint> <name>`.
+
+Guard design after [fblissjr/ComfyUI-h3-explorations](https://github.com/fblissjr/ComfyUI-h3-explorations),
+which shipped a partition fingerprint first.
+
 ## Pruned checkpoints
 
 Pruned H3 UNETs (Comfy-Org `*_pruned_*`, the GGUF/w4a8/nvfp4 re-quants of them) replace the

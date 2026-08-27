@@ -362,6 +362,28 @@ class _PDDHeadLinear(torch.nn.Module):
             out = native + (out - native) * self.strength
         return out
 
+    # Core PR #15908 ("MiniMax-H3: Support PDD LoRA") makes FinalLayer.forward
+    # probe `self.video_out.weight.shape[0] // self.video_out.out_features` to
+    # detect PDD-fused checkpoints BEFORE calling the projection. During our
+    # swap these must resolve to the NATIVE module's attributes: the native
+    # head keeps its original size, so core computes n == 1, takes its stock
+    # path, and calls video_out(h) — which is this module's forward.
+    @property
+    def weight(self):
+        return self._native[0].weight
+
+    @property
+    def bias(self):
+        return self._native[0].bias
+
+    @property
+    def in_features(self):
+        return self._native[0].in_features
+
+    @property
+    def out_features(self):
+        return self._native[0].out_features
+
 
 def make_pdd_final_forward(final_layer, heads, holder, bounds, on_off_grid, strength):
     """Bound replacement for final_layer.forward.
@@ -438,3 +460,83 @@ def split_pdd_state_dict(sd, metadata, filename="<file>"):
             raise ValueError(f"{filename}: {len(leftovers)} unrecognized keys, e.g. "
                              f"{sorted(leftovers)[:4]} — format drift, refusing to load.")
     return lora_sd, heads, config
+
+
+# ---------------------------------------------------------------------------
+# partition fingerprint (fl2va / ref2va pairing check)
+# ---------------------------------------------------------------------------
+# The two trunks ship IDENTICAL key sets, so an FL2VA file applied to a ref2va
+# UNET (or vice versa) patches cleanly and renders silently wrong. The trunks
+# are told apart by final_layer.video_out.weight — fp32-unquantized in every
+# published build and bit-identical across int8_convrot / pruned / rebased
+# variants of one trunk (measured 2026-08-27), while the two trunks sit 0.0503
+# apart in relative Frobenius distance. Compared by DISTANCE, not hash: a dtype
+# cast moves every bit but only ~2e-3 of the value (fp16 fingerprint storage
+# adds ~2e-4). Guard design after fblissjr/ComfyUI-h3-explorations, which
+# shipped it first.
+
+PARTITION_TOLERANCE = 0.015   # >> cast/storage noise (~2e-3), << trunk gap (0.0503)
+KNOWN_PARTITIONS = ("fl2va", "ref2va")
+
+
+def partition_from_name(*names):
+    """Which trunk a file targets, from its metadata/filename strings.
+
+    Returns "fl2va" / "ref2va", or None when no string names exactly one
+    partition token (unknown or ambiguous)."""
+    for s in names:
+        s = (s or "").lower()
+        hits = {p for p in KNOWN_PARTITIONS if p in s}
+        if len(hits) == 1:
+            return hits.pop()
+    return None
+
+
+def identify_trunk(video_out_weight, fingerprints, tol=PARTITION_TOLERANCE):
+    """Match a live final_layer.video_out.weight against shipped fingerprints.
+
+    fingerprints: {partition: weight tensor}. Returns (partition or None,
+    {partition: relative distance})."""
+    live = video_out_weight.detach().to(torch.float32).cpu()
+    dists = {}
+    for name, ref in fingerprints.items():
+        ref = ref.to(torch.float32)
+        if ref.shape != live.shape:
+            continue
+        dists[name] = float((live - ref).norm() / ref.norm())
+    best = min(dists, key=dists.get) if dists else None
+    if best is not None and dists[best] <= tol:
+        return best, dists
+    return None, dists
+
+
+def check_partition_pairing(video_out_weight, fingerprints, file_partition,
+                            pdd_file, mode="error"):
+    """Refuse (or warn about) a PDD file applied to the other trunk's model.
+
+    Returns a note string for the info output. Raises ValueError only when BOTH
+    sides are confidently identified and disagree (mode="error"); an unknown
+    model (finetune/hybrid) or unidentifiable file degrades to a warning note —
+    the check must never block checkpoints it has no fingerprint for."""
+    if not fingerprints:
+        return "partition check skipped: no fingerprints shipped"
+    model_partition, dists = identify_trunk(video_out_weight, fingerprints)
+    dtxt = ", ".join(f"{k} {v:.4f}" for k, v in sorted(dists.items())) or "no shape match"
+    if model_partition is None:
+        return (f"partition check INCONCLUSIVE: model video_out matches no known trunk "
+                f"({dtxt}; tol {PARTITION_TOLERANCE}) — finetune or full-merge? "
+                f"file/model pairing not verified")
+    if file_partition is None:
+        return (f"partition check INCONCLUSIVE: model is {model_partition} "
+                f"({dtxt}) but the file's trunk could not be identified from its "
+                f"name/metadata — pairing not verified")
+    if file_partition != model_partition:
+        msg = (f"{pdd_file} is a {file_partition.upper()} distill but the loaded UNET is the "
+               f"{model_partition} trunk (video_out distance {dtxt}, trunks sit ~0.05 apart). "
+               f"The key sets are identical, so this would apply cleanly and render silently "
+               f"wrong — pair FL2VA with an fl2va UNET, Ref2VA with ref2va. If this pairing "
+               f"is a deliberate experiment, set partition_check to 'warn'.")
+        if mode == "error":
+            raise ValueError(f"MiniMaxH3PDDAccApply: {msg}")
+        return f"partition MISMATCH (continuing, partition_check=warn): {msg}"
+    return f"partition check ok: {file_partition} file on {model_partition} model ({dtxt})"

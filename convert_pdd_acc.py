@@ -25,7 +25,12 @@ import torch
 from safetensors.torch import load_file, save_file
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pdd_acc_core import CONVERTED_FORMAT, HEAD_KEYS, convert_pdd_lora  # noqa: E402
+from pdd_acc_core import (  # noqa: E402
+    CONVERTED_FORMAT,
+    HEAD_KEYS,
+    convert_pdd_lora,
+    partition_from_name,
+)
 
 
 def read_metadata(path):
@@ -69,6 +74,10 @@ def main():
         "source_repo": "alibaba-pai/MiniMax-H3-Acc-LoRAs",
         "source_file": os.path.basename(args.src),
         "source_sha256": src_sha,
+        # which trunk this distill targets (fl2va / ref2va) — read by the Apply
+        # node's partition fingerprint check; empty when the source name names
+        # neither (then the check falls back to the output filename)
+        "pdd_partition": partition_from_name(os.path.basename(args.src)) or "",
         "conversion": ("to_q/k/v -> attn.qkv_proj (concat lora_A, block-diagonal lora_B, "
                        "alpha x3); ff.net.0.proj -> mlp.fc1 (SwiGLU [value;gate] -> "
                        "[gate;value] lora_B row half-swap); ff.net.2 -> mlp.fc2; to_out.0 -> "

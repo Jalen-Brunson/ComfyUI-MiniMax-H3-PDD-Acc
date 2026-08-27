@@ -31,9 +31,11 @@ from .pdd_acc_core import (
     VIDEO_SHIFT,
     HeadBank,
     block_boundaries,
+    check_partition_pairing,
     fine_sigmas,
     fuse_heads,
     make_pdd_final_forward,
+    partition_from_name,
     rebase_adaln_to_curve,
     refit_adaln_basis,
     resolve_partition,
@@ -43,6 +45,25 @@ from .pdd_acc_core import (
 )
 
 WRAPPER_KEY = "minimax_h3_pdd_acc"
+
+_partition_fingerprints = None
+
+
+def _load_partition_fingerprints():
+    """{trunk: fp16 video_out weight} from partition_fingerprints/, cached."""
+    global _partition_fingerprints
+    if _partition_fingerprints is None:
+        _partition_fingerprints = {}
+        fp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "partition_fingerprints")
+        if os.path.isdir(fp_dir):
+            from safetensors.torch import load_file
+            for name in sorted(os.listdir(fp_dir)):
+                if name.startswith("video_out_") and name.endswith(".safetensors"):
+                    trunk = name[len("video_out_"):-len(".safetensors")]
+                    _partition_fingerprints[trunk] = load_file(
+                        os.path.join(fp_dir, name))["video_out_weight"]
+    return _partition_fingerprints
 
 _pdd_dir = os.path.join(folder_paths.models_dir, "pdd_acc")
 os.makedirs(_pdd_dir, exist_ok=True)
@@ -209,6 +230,15 @@ class MiniMaxH3PDDAccApply:
             "bypass_sigmas": ("SIGMAS", {"tooltip": "Returned as the sigmas output when "
                                                     "enabled=False (e.g. a BasicScheduler for the "
                                                     "base model). Ignored when enabled."}),
+            "partition_check": (["error", "warn"],
+                                {"default": "error",
+                                 "tooltip": "fl2va and ref2va share identical key sets, so an "
+                                            "FL2VA file on a ref2va UNET (or vice versa) applies "
+                                            "cleanly and renders silently wrong. The loaded "
+                                            "model's trunk is identified from its "
+                                            "final_layer.video_out fingerprint; a confident "
+                                            "mismatch errors. 'warn' continues anyway "
+                                            "(deliberate cross-trunk experiments)."}),
         }}
 
     RETURN_TYPES = ("MODEL", "SIGMAS", "STRING")
@@ -221,7 +251,7 @@ class MiniMaxH3PDDAccApply:
                    "SigmaShift 12/3. Remove other distill LoRAs (turbo) and cache nodes.")
 
     def apply(self, model, pdd_file, nfe, lora_strength, head_strength, on_off_grid, partition="",
-              enabled=True, bypass_sigmas=None):
+              enabled=True, bypass_sigmas=None, partition_check="error"):
         if not enabled:
             if bypass_sigmas is None:
                 raise ValueError(
@@ -239,6 +269,18 @@ class MiniMaxH3PDDAccApply:
         lora_sd, (vw, vb, aw, ab), config = split_pdd_state_dict(sd, metadata, pdd_file)
         num_steps = config["num_steps"]
         sizes = resolve_partition(num_steps, nfe, partition)
+
+        # ---- partition fingerprint (before any patching: fail on a mispair
+        # early). fl2va/ref2va key sets are identical, so a crossed pairing
+        # would otherwise apply cleanly and render silently wrong. ----
+        meta = metadata or {}
+        file_partition = partition_from_name(
+            meta.get("pdd_partition"), meta.get("source_file"), pdd_file)
+        fp_note = check_partition_pairing(
+            model.get_model_object("diffusion_model.final_layer").video_out.weight,
+            _load_partition_fingerprints(), file_partition, pdd_file,
+            mode=partition_check)
+        logging.info("MiniMaxH3PDDAccApply: %s", fp_note)
 
         # ---- trunk LoRA (normal quant-aware patch path) ----
         lora_sd, curve_note = _curve_rebase_if_pruned(model, lora_sd, pdd_file)
@@ -284,7 +326,8 @@ class MiniMaxH3PDDAccApply:
             f"grid {num_steps} fine steps (trained block {config['block_size']}) -> "
             f"{len(sizes)} steps, blocks {','.join(map(str, sizes))}\n"
             f"lora: {expected_modules} modules @ strength {lora_strength} "
-            f"(alpha {config['alpha']})"
+            f"(alpha {config['alpha']})\n"
+            f"{fp_note}"
             + (f"\n{curve_note}" if curve_note else "") + "\n"
             f"heads: video {list(vW.shape)}, audio {list(aW.shape)} fp32, "
             f"strength {head_strength}\n"
