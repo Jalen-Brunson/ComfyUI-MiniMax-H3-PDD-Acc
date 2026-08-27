@@ -21,6 +21,7 @@ import hashlib
 import re
 
 import torch
+import torch.nn.functional as F
 
 VIDEO_SHIFT = 12.0
 AUDIO_SHIFT = 3.0
@@ -226,6 +227,30 @@ def convert_pdd_lora(sd, alpha):
     return out, leftovers
 
 
+def warmup_schedule(warmup_steps, handoff_sigma, num_steps=32):
+    """Two-phase schedule: undistilled-base warmup, PDD tail.
+
+    Phase 1: `warmup_steps` uniform-in-t steps from sigma 1.0 down to the
+    handoff knot (base model — any sigmas are legal there). Phase 2: the
+    trained PDD block boundaries from the handoff to 0. The handoff must be an
+    nfe-8 grid knot so the tail stays on the trained grid for any Apply-node
+    partition that includes it. Returns (sigmas, phase2_start_step).
+    """
+    knots = fine_sigmas(VIDEO_SHIFT, num_steps)[:: num_steps // 8]
+    matches = [s for s in knots[1:-1] if abs(s - handoff_sigma) <= 1e-4]
+    if not matches:
+        pretty = ", ".join(f"{s:.6f}" for s in knots[1:-1])
+        raise ValueError(f"handoff sigma {handoff_sigma} is not an interior PDD boundary "
+                         f"[{pretty}]")
+    handoff = matches[0]
+    t_handoff = handoff / (VIDEO_SHIFT - (VIDEO_SHIFT - 1.0) * handoff)
+    warm = [shifted_sigma(VIDEO_SHIFT, 1.0 + (t_handoff - 1.0) * i / warmup_steps)
+            for i in range(warmup_steps + 1)]
+    tail = [s for s in knots if s < handoff - 1e-9]
+    sigmas = warm + tail  # warm ends exactly at the handoff knot; tail continues to 0.0
+    return sigmas, warmup_steps
+
+
 # ---------------------------------------------------------------------------
 # pruned (curve-form adaln) support
 # ---------------------------------------------------------------------------
@@ -264,6 +289,109 @@ def rebase_adaln_to_curve(lora_sd, c, V):
         out[mod + ".diff_b"] = (scale * (B @ (A @ c64))).to(torch.float32).contiguous()
         n += 1
     return out, n
+
+
+def refit_adaln_basis(c, V, table_old, table_new):
+    """Refit an affine adaln basis onto a different (but equivalent) table.
+
+    Every pruned H3 checkpoint's adaln_t_table samples the SAME fixed timestep
+    grid, so row i of any two tables describes the same t. A shipped basis
+    gives the modulation curve at row i as y_i = c + V @ table_old_i; solve
+    (c', V') minimizing ||(c' + V' @ table_new_i) - y_i|| by float64 lstsq.
+
+    If table_new is an affine reparameterization of the same trunk's curve
+    (a repacked / requantized pruned build), the relative residual is tiny
+    (same order as the table's own precision); a different trunk's table
+    lands around 1e-1. Returns (c', V', rel_residual) with c'/V' float32.
+    """
+    if table_old.shape[0] != table_new.shape[0]:
+        raise ValueError(f"table row counts differ ({table_old.shape[0]} vs "
+                         f"{table_new.shape[0]}) — not the same timestep grid")
+    y = c.to(torch.float64)[None, :] + table_old.to(torch.float64) @ V.to(torch.float64).T
+    X = torch.cat([torch.ones(table_new.shape[0], 1, dtype=torch.float64),
+                   table_new.to(torch.float64)], dim=1)
+    sol = torch.linalg.lstsq(X, y).solution  # [1+k, out]
+    rel = ((X @ sol - y).norm() / y.norm()).item()
+    c2 = sol[0].to(torch.float32).contiguous()
+    V2 = sol[1:].T.to(torch.float32).contiguous()
+    return c2, V2, rel
+
+
+# ---------------------------------------------------------------------------
+# final-layer PDD head patch (torch-only; nodes.py wires it into ComfyUI)
+# ---------------------------------------------------------------------------
+
+class HeadBank:
+    """Fused per-block head weights, lazily mirrored to each device used."""
+
+    def __init__(self, vw, vb, aw, ab):
+        self.cpu = (vw, vb, aw, ab)
+        self._cache = {}
+
+    def for_device(self, device):
+        d = torch.device(device)
+        if d.type == "cpu":
+            return self.cpu
+        got = self._cache.get(d)
+        if got is None:
+            got = tuple(t.to(d) for t in self.cpu)
+            self._cache[d] = got
+        return got
+
+
+class _PDDHeadLinear(torch.nn.Module):
+    """Transient stand-in for final_layer.video_out / audio_out during a
+    patched forward: applies the armed block's fused head, optionally blended
+    with the native projection at head_strength."""
+
+    def __init__(self, native, heads, is_video, holder, strength):
+        super().__init__()
+        self._native = (native,)  # tuple hides it from nn.Module registration
+        self.heads = heads
+        self.is_video = is_video
+        self.holder = holder
+        self.strength = strength
+
+    def forward(self, h):
+        vW, vB, aW, aB = self.heads.for_device(h.device)
+        W, B = (vW, vB) if self.is_video else (aW, aB)
+        blk = self.holder.blk
+        out = F.linear(h, W[blk].to(h.dtype), B[blk].to(h.dtype))
+        if self.strength != 1.0:
+            native = self._native[0](h)
+            out = native + (out - native) * self.strength
+        return out
+
+
+def make_pdd_final_forward(final_layer, heads, holder, bounds, on_off_grid, strength):
+    """Bound replacement for final_layer.forward.
+
+    Delegates to the CLASS's own forward with the two projection modules
+    temporarily swapped for the armed per-block fused heads. Core-version
+    proof: every ComfyUI since the initial H3 merge mods the streams and then
+    calls self.video_out(hv) / self.audio_out(ha), so the mod math (which
+    changed in #15375 — the private _mod_row helper) is never replicated here.
+    """
+    orig_forward = type(final_layer).forward
+    v_head = _PDDHeadLinear(final_layer.video_out, heads, True, holder, strength)
+    a_head = _PDDHeadLinear(final_layer.audio_out, heads, False, holder, strength)
+
+    def pdd_final_forward(self, x, t_emb, *args, **kwargs):
+        if holder.sigma_v is None:
+            raise RuntimeError(
+                "MiniMaxH3PDDAccApply: final-layer patch invoked without active diffusion-call "
+                "state. Do not stack caching packs (T8 blockcache / EasyCache / Spectrum) on a "
+                "PDD-patched model.")
+        holder.blk = select_block(holder.sigma_v, bounds, on_off_grid)
+        native_v, native_a = self.video_out, self.audio_out
+        try:
+            self.video_out, self.audio_out = v_head, a_head
+            return orig_forward(self, x, t_emb, *args, **kwargs)
+        finally:
+            self.video_out, self.audio_out = native_v, native_a
+            holder.blk = None
+
+    return pdd_final_forward.__get__(final_layer, final_layer.__class__)
 
 
 # ---------------------------------------------------------------------------

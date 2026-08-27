@@ -28,15 +28,19 @@ import reference_minimax_h3_pdd as ref  # noqa: E402
 from pdd_acc_core import (  # noqa: E402
     AUDIO_SHIFT,
     VIDEO_SHIFT,
+    HeadBank,
     block_boundaries,
     convert_pdd_lora,
     fine_sigmas,
     fuse_heads,
+    make_pdd_final_forward,
     rebase_adaln_to_curve,
+    refit_adaln_basis,
     resolve_partition,
     select_block,
     shifted_sigma,
     split_pdd_state_dict,
+    warmup_schedule,
 )
 
 PDD_FILE = "/workspace/ComfyUI/models/pdd_acc/MiniMax-H3-FL2VA-Acc-8Step.safetensors"
@@ -337,6 +341,39 @@ def test_split_both_formats_roundtrip():
         assert torch.equal(a, b)
 
 
+def test_warmup_schedule():
+    knots = fine_sigmas(VIDEO_SHIFT, 32)[::4]
+    sigmas, p2 = warmup_schedule(8, 0.800000)
+    assert p2 == 8 and len(sigmas) == 11
+    assert abs(sigmas[8] - 0.8) < 1e-9            # handoff lands exactly on the knot
+    assert abs(sigmas[9] - knots[7]) < 1e-12      # 0.631579...
+    assert sigmas[10] == 0.0
+    assert all(a > b for a, b in zip(sigmas, sigmas[1:]))
+    # warmup segment is uniform in pre-shift t
+    ts = [s / (VIDEO_SHIFT - (VIDEO_SHIFT - 1) * s) for s in sigmas[:9]]
+    dts = [a - b for a, b in zip(ts, ts[1:])]
+    assert max(dts) - min(dts) < 1e-12
+    # phase-2 sigmas are all boundaries of the trained 8-step grid -> arming works
+    bounds = block_boundaries(32, resolve_partition(32, 8))
+    for s in sigmas[8:-1]:
+        assert select_block(s, bounds, "error") >= 0
+    # other handoffs
+    sig2, p2b = warmup_schedule(6, 0.631579)
+    assert p2b == 6 and len(sig2) == 8 and abs(sig2[6] - knots[7]) < 1e-4
+    sig3, _ = warmup_schedule(4, 0.878049)
+    assert [round(s, 6) for s in sig3[4:]] == [0.878049, 0.8, 0.631579, 0.0]
+    # 2 base + 6 PDD: uniform-t warmup evals land exactly on the first trained knots
+    sig4, p4 = warmup_schedule(2, 0.972973)
+    assert p4 == 2 and len(sig4) == 9
+    assert [round(s, 6) for s in sig4] == [1.0, 0.988235, 0.972973, 0.952381,
+                                           0.923077, 0.878049, 0.8, 0.631579, 0.0]
+    try:
+        warmup_schedule(8, 0.9)
+        raise AssertionError("off-grid handoff must be rejected")
+    except ValueError:
+        pass
+
+
 def test_curve_rebase_equivalence():
     # Build a synthetic "dense curve" u(t) that is exactly affine in a rank-k
     # table (how real pruned checkpoints were made), rebase a random adaln
@@ -423,6 +460,192 @@ def test_real_file_full_convert():
     Bu = sd["transformer_blocks.0.ff.net.0.proj.lora_up"]
     Bc = out["diffusion_model.blocks.0.mlp.fc1.lora_B.weight"]
     assert torch.equal(Bc[:14336], Bu[14336:]) and torch.equal(Bc[14336:], Bu[:14336])
+
+
+def test_refit_basis_equivalent_table():
+    """A table that is an affine reparameterization of the same trunk's curve
+    (repacked / requantized pruned build, issue #1) must refit at ~zero
+    residual and produce the same rebased diffs as the original basis."""
+    torch.manual_seed(7)
+    N, k, out_dim, rank = 65, 8, 48, 4
+    c = torch.randn(out_dim)
+    V = torch.randn(out_dim, k)
+    table = torch.randn(N, k)
+    # affine reparameterization: table2 carries the same curve in new coordinates
+    M = torch.randn(k, k) + 4.0 * torch.eye(k)  # well-conditioned invertible
+    m = torch.randn(k)
+    table2 = table @ M.T + m
+    c2, V2, rel = refit_adaln_basis(c, V, table, table2)
+    assert rel < 1e-6, rel  # fp32 storage of c/V/table bounds the f64 fit
+    # curve reconstructed from the refit basis matches the original curve
+    y = c[None] + table @ V.T
+    y2 = c2[None] + table2 @ V2.T
+    assert torch.allclose(y, y2, atol=1e-4), (y - y2).abs().max()
+    # rebased LoRA diffs agree between the two bases
+    A = torch.randn(rank, out_dim)
+    B = torch.randn(6, rank)
+    sd = {"m.adaln_proj.linear.lora_A.weight": A,
+          "m.adaln_proj.linear.lora_B.weight": B,
+          "m.adaln_proj.linear.alpha": torch.tensor(float(rank))}
+    r1, n1 = rebase_adaln_to_curve(dict(sd), c, V)
+    r2, n2 = rebase_adaln_to_curve(dict(sd), c2, V2)
+    assert n1 == n2 == 1
+    # the diffs live in different table coordinates and the DC term shifts
+    # between bases, so compare the full effect on each grid row:
+    # diff_b + diff @ t_i must agree (that is what the adaln module computes)
+    e1 = (r1["m.adaln_proj.linear.diff_b"].to(torch.float64)[:, None]
+          + r1["m.adaln_proj.linear.diff"].to(torch.float64) @ table.to(torch.float64).T)
+    e2 = (r2["m.adaln_proj.linear.diff_b"].to(torch.float64)[:, None]
+          + r2["m.adaln_proj.linear.diff"].to(torch.float64) @ table2.to(torch.float64).T)
+    assert torch.allclose(e1, e2, atol=1e-3), (e1 - e2).abs().max()
+
+
+def test_refit_basis_rejects_foreign_table():
+    torch.manual_seed(8)
+    N, k, out_dim = 65, 8, 48
+    c = torch.randn(out_dim)
+    V = torch.randn(out_dim, k)
+    table = torch.randn(N, k)
+    _, _, rel = refit_adaln_basis(c, V, table, torch.randn(N, k))
+    assert rel > 5e-2, f"foreign table fit unexpectedly well: {rel}"
+    try:
+        refit_adaln_basis(c, V, table, torch.randn(N + 1, k))
+        raise AssertionError("row-count mismatch should raise")
+    except ValueError:
+        pass
+
+
+class _PreModRowFinalLayer(torch.nn.Module):
+    """Verbatim replica of core FinalLayer.forward BEFORE #15375 (no _mod_row):
+    the delegation patch must work against this signature/body unchanged."""
+
+    def __init__(self, hidden, vdim, adim):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(hidden, elementwise_affine=False)
+        self.video_out = torch.nn.Linear(hidden, vdim)
+        self.audio_out = torch.nn.Linear(hidden, adim)
+        self.register_buffer("shift", torch.randn(2, hidden))
+        self.register_buffer("scale", torch.randn(2, hidden))
+
+    def adaln_proj(self, t_emb):
+        return self.shift, self.scale
+
+    def forward(self, x, t_emb, video_seg, audio_seg):
+        shift, scale = self.adaln_proj(t_emb)
+        va, vb, vrow = video_seg
+        aa, ab, arow = audio_seg
+        hv = (self.norm(x[va:vb]) * (1.0 + scale[vrow]) + shift[vrow]).to(torch.float32)
+        ha = (self.norm(x[aa:ab]) * (1.0 + scale[arow]) + shift[arow]).to(torch.float32)
+        return self.video_out(hv), self.audio_out(ha)
+
+
+def _native_stacked_bank(fl, S):
+    vW = fl.video_out.weight.detach()[None].repeat(S, 1, 1).clone()
+    vB = fl.video_out.bias.detach()[None].repeat(S, 1).clone()
+    aW = fl.audio_out.weight.detach()[None].repeat(S, 1, 1).clone()
+    aB = fl.audio_out.bias.detach()[None].repeat(S, 1).clone()
+    return vW, vB, aW, aB
+
+
+def _delegation_checks(fl, x, t_emb, vseg, aseg):
+    from types import SimpleNamespace
+    native = fl(x, t_emb, vseg, aseg)
+    sizes = (4,) * 8
+    bounds = block_boundaries(32, sizes)
+    vW, vB, aW, aB = _native_stacked_bank(fl, 8)
+    # make block 3 distinctive
+    vW[3] += 1.0
+    vB[3] -= 0.5
+    aW[3] *= 2.0
+    heads = HeadBank(vW, vB, aW, aB)
+    holder = SimpleNamespace(sigma_v=None, blk=None)
+    patched = make_pdd_final_forward(fl, heads, holder, bounds, "error", 1.0)
+
+    # unarmed (no wrapper state) -> refuse, and native modules stay in place
+    try:
+        patched(x, t_emb, vseg, aseg)
+        raise AssertionError("expected RuntimeError when unarmed")
+    except RuntimeError:
+        pass
+    assert isinstance(fl.video_out, torch.nn.Linear)
+
+    # block 0: bank == native there -> identical to the unpatched forward
+    holder.sigma_v = bounds[0]
+    v, a = patched(x, t_emb, vseg, aseg)
+    assert torch.allclose(v, native[0], atol=1e-6)
+    assert torch.allclose(a, native[1], atol=1e-6)
+
+    # block 3: distinctive weights; (W+1, b-0.5) => native + rowsum(hv) - 0.5
+    holder.sigma_v = bounds[3]
+    v3, a3 = patched(x, t_emb, vseg, aseg)
+    assert not torch.allclose(v3, native[0], atol=1e-4)
+    diff = v3 - native[0]
+    assert torch.allclose(diff, diff[..., :1].expand_as(diff), atol=1e-5), \
+        "W+1 head must shift all outputs of a row by the same amount (rowsum(hv) - 0.5)"
+    assert torch.allclose(a3, native[1] * 2.0 - fl.audio_out.bias, atol=1e-5)
+
+    # head_strength 0.0 -> pure native even on the distinctive block
+    patched0 = make_pdd_final_forward(fl, heads, holder, bounds, "error", 0.0)
+    holder.sigma_v = bounds[3]
+    v0, a0 = patched0(x, t_emb, vseg, aseg)
+    assert torch.allclose(v0, native[0], atol=1e-6)
+    assert torch.allclose(a0, native[1], atol=1e-6)
+
+    # projections restored after every call
+    assert isinstance(fl.video_out, torch.nn.Linear)
+    assert isinstance(fl.audio_out, torch.nn.Linear)
+    again = fl(x, t_emb, vseg, aseg)
+    assert torch.allclose(again[0], native[0], atol=0.0)
+
+
+def test_final_forward_delegation_pre_modrow_core():
+    torch.manual_seed(9)
+    fl = _PreModRowFinalLayer(16, 6, 3)
+    x = torch.randn(10, 16)
+    _delegation_checks(fl, x, torch.randn(2, 8), (0, 7, 0), (7, 10, 1))
+
+
+def test_final_forward_delegation_current_core():
+    try:
+        import comfy.ops
+        from comfy.ldm.minimax.model import FinalLayer
+    except Exception:
+        SKIP.append("final_forward_current_core (comfy not importable)")
+        return
+    torch.manual_seed(10)
+    fl = FinalLayer(16, 8, 6, 3, eps=1e-6, operations=comfy.ops.disable_weight_init)
+    with torch.no_grad():
+        for p in fl.parameters():
+            torch.nn.init.normal_(p, std=0.3)
+    x = torch.randn(10, 16)
+    _delegation_checks(fl, x, torch.randn(2, 8), (0, 7, 0), (7, 10, 1))
+
+
+def test_apply_bypass():
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "minimax_h3_pdd_acc_testpkg", os.path.join(PACK, "__init__.py"),
+            submodule_search_locations=[PACK])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules["minimax_h3_pdd_acc_testpkg"] = pkg
+        spec.loader.exec_module(pkg)
+    except Exception as e:
+        SKIP.append(f"apply_bypass (comfy not importable: {type(e).__name__})")
+        return
+    node = pkg.NODE_CLASS_MAPPINGS["MiniMaxH3PDDAccApply"]()
+    model = object()
+    sig = torch.tensor([1.0, 0.5, 0.0])
+    m, s, info = node.apply(model=model, pdd_file="missing.safetensors", nfe="8",
+                            lora_strength=1.0, head_strength=1.0, on_off_grid="error",
+                            enabled=False, bypass_sigmas=sig)
+    assert m is model and s is sig and "BYPASS" in info
+    try:
+        node.apply(model=model, pdd_file="missing.safetensors", nfe="8", lora_strength=1.0,
+                   head_strength=1.0, on_off_grid="error", enabled=False)
+        raise AssertionError("bypass without bypass_sigmas should raise")
+    except ValueError:
+        pass
 
 
 if __name__ == "__main__":
