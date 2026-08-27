@@ -159,9 +159,13 @@ def _curve_rebase_if_pruned(model, lora_sd, pdd_file):
     name, c, V, extra = match
     trunk = name[len("basis_"):-len(".safetensors")]
     if trunk not in pdd_file.lower():
-        logging.warning("MiniMaxH3PDDAccApply: model's adaln table is the %s trunk but the PDD "
-                        "file is %s — trunk mismatch? Pair FL2VA with fl2va, Ref2VA with ref2va.",
-                        trunk, pdd_file)
+        logging.warning(
+            "MiniMaxH3PDDAccApply: model's adaln table is the %s trunk but the PDD file is %s. "
+            "On a PLAIN trunk this is a real mispairing (FL2VA pairs with fl2va, Ref2VA with "
+            "ref2va). On a %s-BASED HYBRID (e.g. fl2va+ref2va block merges) the table always "
+            "comes from the base trunk, so this pairing may be intentional — PDD still applies "
+            "(see the info output), but hybrids are off-label/untested for PDD.",
+            trunk, pdd_file, trunk)
     lora_sd, n = rebase_adaln_to_curve(lora_sd, c, V)
     return lora_sd, f"pruned model: {n} adaln modules rebased onto the {trunk} curve basis{extra}"
 

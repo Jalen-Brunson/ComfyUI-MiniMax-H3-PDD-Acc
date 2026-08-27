@@ -106,6 +106,16 @@ it is not a repack of a known trunk — bake a basis with `bake_adaln_basis.py` 
 docstring) or open an issue naming the exact checkpoint file/source so a basis can be
 shipped.
 
+**Hybrid trunks (fl2va+ref2va block merges):** a hybrid carries ONE adaln table — its BASE
+trunk's — so e.g. an fl2va-based `b15-49` hybrid matches the fl2va basis and pairing it with
+the Ref2VA PDD file logs a trunk-mismatch warning. If the hybrid pairing is what you intend,
+the warning is informational: PDD fully applies (the node fails closed if any patch key
+misses, and sampling would error — not silently skip PDD — if the heads were not armed;
+check the `info` output for the applied module count). But hybrids are **off-label for
+PDD**: the trunk LoRA and head bank were trained on the pure trunks, so quality on a merge
+is untested. If output looks weak or wrong, A/B against the matching plain trunk before
+blaming settings.
+
 ## Example workflows
 
 - [`example_workflows/pdd_acc_t2v_basic.json`](example_workflows/pdd_acc_t2v_basic.json) —
