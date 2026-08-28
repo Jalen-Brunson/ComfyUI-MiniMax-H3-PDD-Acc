@@ -115,9 +115,17 @@ def make_wrapper(holder):
 
 
 def _sigmas_tensor(bounds):
+    # Snap the float32 endpoints to their analytic values — but ONLY when they
+    # are already those endpoints. Unconditional t[0] = 1.0 silently rewrote a
+    # denoise-sliced schedule ([0.8, 0.632, 0] -> [1.0, 0.632, 0]): the resume
+    # latent was discarded at full noise and block 0's head was integrated
+    # across a 37% sigma span — structured "water droplet" garbage (found via
+    # the latent-upscale two-pass flow, 2026-08-28).
     t = torch.tensor(bounds, dtype=torch.float32)
-    t[0] = 1.0
-    t[-1] = 0.0
+    if abs(float(t[0]) - 1.0) < 1e-4:
+        t[0] = 1.0
+    if abs(float(t[-1])) < 1e-4:
+        t[-1] = 0.0
     return t
 
 

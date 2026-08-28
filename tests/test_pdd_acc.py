@@ -789,6 +789,32 @@ def test_av_latent_upscale_node():
         pass
 
 
+def test_scheduler_denoise_slice_keeps_resume_sigma():
+    """Regression: _sigmas_tensor force-snapped sigmas[0] to 1.0, so a
+    denoise-sliced schedule silently became a full-noise start and the resume
+    latent was discarded (water-droplet garble in two-pass upscale flows)."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "minimax_h3_pdd_acc_testpkg3", os.path.join(PACK, "__init__.py"),
+            submodule_search_locations=[PACK])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules["minimax_h3_pdd_acc_testpkg3"] = pkg
+        spec.loader.exec_module(pkg)
+    except Exception as e:
+        SKIP.append(f"scheduler_denoise_slice (comfy not importable: {type(e).__name__})")
+        return
+    sched = pkg.NODE_CLASS_MAPPINGS["MiniMaxH3PDDAccScheduler"]()
+    (full,) = sched.get_sigmas("8", 1.0)
+    assert float(full[0]) == 1.0 and float(full[-1]) == 0.0 and full.numel() == 9
+    (s25,) = sched.get_sigmas("8", 0.25)
+    assert s25.numel() == 3 and abs(float(s25[0]) - 0.8) < 1e-5, \
+        f"denoise 0.25 must resume at 0.8, got {float(s25[0])}"
+    (s50,) = sched.get_sigmas("8", 0.5)
+    assert s50.numel() == 5 and abs(float(s50[0]) - 0.923077) < 1e-5
+    assert float(s25[-1]) == 0.0 and float(s50[-1]) == 0.0
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:
