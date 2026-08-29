@@ -153,6 +153,21 @@ blaming settings.
   handle H3's nested video+audio latent; it resizes the video half per frame (audio passes
   through) and snaps to the model's 2x2 patch grid.
 
+- [`example_workflows/pdd_video_upscale_long.json`](example_workflows/pdd_video_upscale_long.json) —
+  **upscale an EXISTING video of any length** (video-to-video hi-res fix): load by path,
+  VAE-encode, neural latent upscale to 1344x768, then a PDD partial-denoise refine
+  (`denoise 0.25` = last 2 trained blocks) sampled in 73-frame windows with 22-frame
+  overlap and anchor frames — so a 70s clip refines in ~25 cheap windows instead of one
+  quadratic-cost 500k-token pass. The source audio is muxed straight through untouched.
+  The neural upscaler and the windowed refine sampler (`MinimaxH3LatentUpscaler3D`,
+  `MMH3SplitUpscale`, `MMH3TemporalSplitParams`) are by **LBH-123-AI** — install their
+  [Comfyui_Minimax_h3_latent_Upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
+  node pack and download the
+  [upscaler model](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) into
+  `models/latent_upscale_models/`. Also needs
+  [VideoHelperSuite](https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite) for the video load.
+  Using the mamad-converted PDD file instead: set nfe 4 on BOTH the Apply node and the Scheduler.
+
 ## Converter (optional)
 
 `convert_pdd_acc.py` produces the pre-converted redistribution format from an original file —
