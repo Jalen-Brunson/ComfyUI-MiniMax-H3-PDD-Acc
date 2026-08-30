@@ -93,7 +93,9 @@ tensor is fp32-unquantized in every published build, bit-identical across the
 int8_convrot/pruned/rebased variants of one trunk, and the two trunks sit 0.0503 apart in
 relative Frobenius distance (fingerprints shipped fp16 in `partition_fingerprints/`,
 tolerance 0.015 ≫ cast/storage noise ~2e-3). A confident mismatch **errors**; set the
-optional `partition_check` input to `warn` for deliberate cross-trunk experiments. A
+optional `partition_check` input to `warn` for deliberate cross-trunk experiments, or to
+`off` to disable the model-type analysis entirely — the fingerprint check never runs and
+mispairings apply unchecked (the info output notes it). A
 finetune or full-merge that matches neither fingerprint just logs "inconclusive" and
 proceeds — the guard never blocks checkpoints it has no fingerprint for. New trunks:
 `python3 bake_partition_fingerprint.py <checkpoint> <name>`.
