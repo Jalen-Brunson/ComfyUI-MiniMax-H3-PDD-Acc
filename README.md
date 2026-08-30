@@ -181,6 +181,42 @@ python3 convert_pdd_acc.py MiniMax-H3-FL2VA-Acc-8Step.safetensors \
 Output is bit-identical to what the loader computes in memory (tested), with the trunk LoRA
 in standard `diffusion_model.*.lora_A/B.weight` + `.alpha` keys and full provenance metadata.
 
+## Baking the trunk (optional — for cards where the model doesn't fully fit)
+
+ComfyUI merges LoRA patches into weights **once at load** — but only for modules that fit
+in VRAM. Offloaded modules get a per-forward patch instead: the LoRA (plus a dequantize) is
+re-applied on **every step**. On a card at the VRAM edge that fixed per-step cost is large
+at low resolutions (issue #4 measured ~2× s/it at 864×480 on a 32GB RTX 5090) and vanishes
+into attention time at high ones. **If your model fully loads, baking buys you nothing** —
+the runtime path already costs zero per step there.
+
+`bake_pdd_trunk.py` merges the trunk LoRA (and the adaln update — curve-rebased first on
+pruned bases) into the quantized checkpoint offline, using the same `comfy-kitchen` kernels
+ComfyUI dequantizes with. Only the head bank stays runtime — it swaps `final_layer` per
+fine-interval and cannot be baked. The write is streaming (peak RAM is one module, not one
+checkpoint) and every tensor keeps its exact dtype, shape and byte length:
+
+```bash
+# audit first (no write): requant error per sampled module
+python3 bake_pdd_trunk.py --check \
+    --base minimax_h3_ref2va_int8_convrot.safetensors \
+    --pdd  MiniMax-H3-Ref2VA-Acc-8Step.safetensors
+
+python3 bake_pdd_trunk.py \
+    --base minimax_h3_ref2va_int8_convrot.safetensors \
+    --pdd  MiniMax-H3-Ref2VA-Acc-8Step.safetensors \
+    --out  minimax_h3_ref2va_pddbaked_int8_convrot.safetensors
+```
+
+Load the baked file with a normal UNETLoader and set the Apply node's **`lora_strength`
+to `0.0`** (baked-trunk mode: trunk patching skipped, heads/sigmas/guards unchanged; the
+info output says so). Caveats: the strength is frozen into the file (re-bake to change
+it); on an **unbaked** trunk, strength 0.0 renders the un-distilled model with PDD heads —
+nothing can detect that, so check your file's `pdd_acc_baked` metadata if unsure. GGUF and
+non-convrot formats are refused, not guessed. Requantizing the merged weight costs the
+same class of error the runtime merge pays (it also requantizes); the `--check` audit
+prints the measured number for your files.
+
 ## How it works (short version)
 
 - **LoRA conversion** (verified against both codebases' sources): `to_q/to_k/to_v` fuse into

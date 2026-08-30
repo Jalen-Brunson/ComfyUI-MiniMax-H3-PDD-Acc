@@ -216,7 +216,10 @@ class MiniMaxH3PDDAccApply:
                                 "non-uniform default partition 8,8,4,4,4,4. Higher step counts "
                                 "are OFF the training envelope and render as noise."}),
             "lora_strength": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.01,
-                                        "tooltip": "Trunk LoRA strength. Trained at 1.0."}),
+                                        "tooltip": "Trunk LoRA strength. Trained at 1.0. "
+                                                   "0.0 = baked-trunk mode: skip trunk patching "
+                                                   "entirely for a checkpoint pre-merged with "
+                                                   "bake_pdd_trunk.py (heads still apply)."}),
             "head_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01,
                                         "tooltip": "PDD head blend: native + s*(pdd - native). "
                                                    "1.0 = trained path (native head not evaluated)."}),
@@ -292,19 +295,35 @@ class MiniMaxH3PDDAccApply:
         logging.info("MiniMaxH3PDDAccApply: %s", fp_note)
 
         # ---- trunk LoRA (normal quant-aware patch path) ----
-        lora_sd, curve_note = _curve_rebase_if_pruned(model, lora_sd, pdd_file)
-        expected_keys = sum(1 for k in lora_sd
-                            if k.endswith((".lora_A.weight", ".diff", ".diff_b")))
-        expected_modules = sum(1 for k in lora_sd if k.endswith((".lora_A.weight", ".diff")))
-        key_map = comfy.lora.model_lora_keys_unet(model.model, {})
-        loaded = comfy.lora.load_lora(lora_sd, key_map)
-
+        # strength 0.0 is BAKED-TRUNK mode, not "apply at zero": a checkpoint
+        # pre-merged with bake_pdd_trunk.py already carries the trunk LoRA in
+        # its quantized weights, so patching is skipped entirely — that is the
+        # point of baking (offloaded modules re-apply patches EVERY forward,
+        # issue #4). Heads, sigmas and all guards still apply. On an UNBAKED
+        # trunk this renders the plain model with PDD heads — off the training
+        # envelope; nothing can detect that here, so the info output says so.
         m = model.clone()
-        applied = m.add_patches(loaded, lora_strength)
-        if len(applied) != expected_keys:
-            raise ValueError(
-                f"MiniMaxH3PDDAccApply: only {len(applied)}/{expected_keys} LoRA patch keys "
-                f"matched the loaded model — is this a MiniMax-H3 UNET of the matching trunk?")
+        if lora_strength == 0.0:
+            curve_note = ""
+            expected_modules = 0
+            lora_note = ("lora: SKIPPED (strength 0.0 = baked-trunk mode; the loaded UNET "
+                         "must be a bake_pdd_trunk.py output, or this renders the un-distilled "
+                         "trunk with PDD heads)")
+        else:
+            lora_sd, curve_note = _curve_rebase_if_pruned(model, lora_sd, pdd_file)
+            expected_keys = sum(1 for k in lora_sd
+                                if k.endswith((".lora_A.weight", ".diff", ".diff_b")))
+            expected_modules = sum(1 for k in lora_sd if k.endswith((".lora_A.weight", ".diff")))
+            key_map = comfy.lora.model_lora_keys_unet(model.model, {})
+            loaded = comfy.lora.load_lora(lora_sd, key_map)
+
+            applied = m.add_patches(loaded, lora_strength)
+            if len(applied) != expected_keys:
+                raise ValueError(
+                    f"MiniMaxH3PDDAccApply: only {len(applied)}/{expected_keys} LoRA patch keys "
+                    f"matched the loaded model — is this a MiniMax-H3 UNET of the matching trunk?")
+            lora_note = (f"lora: {expected_modules} modules @ strength {lora_strength} "
+                         f"(alpha {config['alpha']})")
 
         # ---- head bank ----
         final_layer = m.get_model_object("diffusion_model.final_layer")
@@ -334,8 +353,7 @@ class MiniMaxH3PDDAccApply:
             f"PDD Acc: {pdd_file} ({config['source_format']} format)\n"
             f"grid {num_steps} fine steps (trained block {config['block_size']}) -> "
             f"{len(sizes)} steps, blocks {','.join(map(str, sizes))}\n"
-            f"lora: {expected_modules} modules @ strength {lora_strength} "
-            f"(alpha {config['alpha']})\n"
+            f"{lora_note}\n"
             f"{fp_note}"
             + (f"\n{curve_note}" if curve_note else "") + "\n"
             f"heads: video {list(vW.shape)}, audio {list(aW.shape)} fp32, "

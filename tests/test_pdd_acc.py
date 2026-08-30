@@ -553,7 +553,14 @@ def _native_stacked_bank(fl, S):
 
 def _delegation_checks(fl, x, t_emb, vseg, aseg):
     from types import SimpleNamespace
-    native = fl(x, t_emb, vseg, aseg)
+    import inspect
+    # post-#15908 core grew (sigma, sample_sigmas, shifts) for its native PDD
+    # head banks — required positionally, ignored on the stock n==1 path this
+    # test exercises. Branch on the observable (the parameter), not a version.
+    extra = ()
+    if "sigma" in inspect.signature(type(fl).forward).parameters:
+        extra = (torch.tensor(1.0), None, (12.0, 3.0))
+    native = fl(x, t_emb, vseg, aseg, *extra)
     sizes = (4,) * 8
     bounds = block_boundaries(32, sizes)
     vW, vB, aW, aB = _native_stacked_bank(fl, 8)
@@ -567,7 +574,7 @@ def _delegation_checks(fl, x, t_emb, vseg, aseg):
 
     # unarmed (no wrapper state) -> refuse, and native modules stay in place
     try:
-        patched(x, t_emb, vseg, aseg)
+        patched(x, t_emb, vseg, aseg, *extra)
         raise AssertionError("expected RuntimeError when unarmed")
     except RuntimeError:
         pass
@@ -575,13 +582,13 @@ def _delegation_checks(fl, x, t_emb, vseg, aseg):
 
     # block 0: bank == native there -> identical to the unpatched forward
     holder.sigma_v = bounds[0]
-    v, a = patched(x, t_emb, vseg, aseg)
+    v, a = patched(x, t_emb, vseg, aseg, *extra)
     assert torch.allclose(v, native[0], atol=1e-6)
     assert torch.allclose(a, native[1], atol=1e-6)
 
     # block 3: distinctive weights; (W+1, b-0.5) => native + rowsum(hv) - 0.5
     holder.sigma_v = bounds[3]
-    v3, a3 = patched(x, t_emb, vseg, aseg)
+    v3, a3 = patched(x, t_emb, vseg, aseg, *extra)
     assert not torch.allclose(v3, native[0], atol=1e-4)
     diff = v3 - native[0]
     assert torch.allclose(diff, diff[..., :1].expand_as(diff), atol=1e-5), \
@@ -591,14 +598,14 @@ def _delegation_checks(fl, x, t_emb, vseg, aseg):
     # head_strength 0.0 -> pure native even on the distinctive block
     patched0 = make_pdd_final_forward(fl, heads, holder, bounds, "error", 0.0)
     holder.sigma_v = bounds[3]
-    v0, a0 = patched0(x, t_emb, vseg, aseg)
+    v0, a0 = patched0(x, t_emb, vseg, aseg, *extra)
     assert torch.allclose(v0, native[0], atol=1e-6)
     assert torch.allclose(a0, native[1], atol=1e-6)
 
     # projections restored after every call
     assert isinstance(fl.video_out, torch.nn.Linear)
     assert isinstance(fl.audio_out, torch.nn.Linear)
-    again = fl(x, t_emb, vseg, aseg)
+    again = fl(x, t_emb, vseg, aseg, *extra)
     assert torch.allclose(again[0], native[0], atol=0.0)
 
 
@@ -813,6 +820,167 @@ def test_scheduler_denoise_slice_keeps_resume_sigma():
     (s50,) = sched.get_sigmas("8", 0.5)
     assert s50.numel() == 5 and abs(float(s50[0]) - 0.923077) < 1e-5
     assert float(s25[-1]) == 0.0 and float(s50[-1]) == 0.0
+
+
+def test_bake_synthetic_stream():
+    """bake_pdd_trunk end to end on a tiny fabricated checkpoint: baked quant
+    codes must equal the deterministic requant of the exact merge, plain-dtype
+    targets a plain add, bystanders byte-identical, metadata stamped."""
+    try:
+        from comfy_kitchen.backends.eager.quantization import (
+            dequantize_int8_convrot_weight, quantize_int8_convrot_weight)
+    except ImportError:
+        SKIP.append("bake_synthetic (comfy_kitchen not importable)")
+        return
+    import tempfile
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    import bake_pdd_trunk as bake
+
+    torch.manual_seed(11)
+    w_q_f = torch.randn(24, 128)
+    q, sc = quantize_int8_convrot_weight(w_q_f, 64)
+    cq = json.dumps({"format": "int8_tensorwise", "convrot": True,
+                     "convrot_groupsize": 64}).encode()
+    base_sd = {
+        "blocks.0.attn.qkv_proj.weight": q,
+        "blocks.0.attn.qkv_proj.weight_scale": sc.float(),
+        "blocks.0.attn.qkv_proj.comfy_quant": torch.tensor(list(cq), dtype=torch.uint8),
+        "token_refiner.blocks.0.mlp.fc2.weight": torch.randn(6, 10).bfloat16(),
+        "final_layer.video_out.weight": torch.randn(4, 8),
+    }
+    A1, B1 = torch.randn(4, 128), torch.randn(24, 4)
+    A2, B2 = torch.randn(2, 10), torch.randn(6, 2)
+    pdd_sd = {
+        "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight": A1,
+        "diffusion_model.blocks.0.attn.qkv_proj.lora_B.weight": B1,
+        "diffusion_model.blocks.0.attn.qkv_proj.alpha": torch.tensor(12.0),
+        "diffusion_model.token_refiner.blocks.0.mlp.fc2.lora_A.weight": A2,
+        "diffusion_model.token_refiner.blocks.0.mlp.fc2.lora_B.weight": B2,
+        "diffusion_model.token_refiner.blocks.0.mlp.fc2.alpha": torch.tensor(2.0),
+        "proj_out.weight": torch.randn(32, 5, 7), "proj_out.bias": torch.randn(32, 5),
+        "audio_proj_out.weight": torch.randn(32, 3, 7),
+        "audio_proj_out.bias": torch.randn(32, 3),
+    }
+    strength = 0.5
+    with tempfile.TemporaryDirectory() as td:
+        bp, pp, op = (os.path.join(td, n) for n in ("base.st", "pdd.st", "out.st"))
+        save_file(base_sd, bp, metadata={"keepme": "yes"})
+        save_file(pdd_sd, pp, metadata={"pdd_num_steps": "32", "pdd_block_size": "4",
+                                        "lora_alpha": "64.0"})
+        bake.bake_stream(bp, pp, op, strength)
+
+        hin, _ = bake.read_header(bp)
+        hout, _ = bake.read_header(op)
+        meta_out = hout.pop("__metadata__")
+        hin.pop("__metadata__", None)
+        assert meta_out["pdd_acc_baked"] == "true" and meta_out["keepme"] == "yes"
+        assert {k: (v["dtype"], v["shape"]) for k, v in hin.items()} == \
+               {k: (v["dtype"], v["shape"]) for k, v in hout.items()}
+
+        with safe_open(op, framework="pt") as f:
+            # bystander untouched
+            assert torch.equal(f.get_tensor("final_layer.video_out.weight"),
+                               base_sd["final_layer.video_out.weight"])
+            assert torch.equal(f.get_tensor("blocks.0.attn.qkv_proj.comfy_quant"),
+                               base_sd["blocks.0.attn.qkv_proj.comfy_quant"])
+            # quant target: codes equal the deterministic requant of the exact merge
+            # (alpha/rank = 12/4 = 3.0)
+            exact = dequantize_int8_convrot_weight(q, sc.float(), 64) + \
+                strength * 3.0 * (B1 @ A1)
+            q_ref, sc_ref = quantize_int8_convrot_weight(exact.float(), 64)
+            assert torch.equal(f.get_tensor("blocks.0.attn.qkv_proj.weight"), q_ref)
+            assert torch.allclose(f.get_tensor("blocks.0.attn.qkv_proj.weight_scale"),
+                                  sc_ref.float())
+            # plain-dtype target: plain add, cast back (alpha/rank = 2/2 = 1.0)
+            w2 = base_sd["token_refiner.blocks.0.mlp.fc2.weight"]
+            want = (w2.float() + strength * (B2 @ A2)).bfloat16()
+            assert torch.equal(f.get_tensor("token_refiner.blocks.0.mlp.fc2.weight"), want)
+
+        worst = bake.audit(bp, pp, strength, sample=2, baked_path=op)
+        assert worst < 5e-2
+
+
+def test_bake_check_real_files():
+    """audit() on the real trunk + PDD file: every sampled module dequantizes,
+    merges and round-trips within int8 storage noise."""
+    base = "/workspace/ComfyUI/models/diffusion_models/minimax_h3_ref2va_int8_convrot.safetensors"
+    pdd = "/workspace/ComfyUI/models/pdd_acc/MiniMax-H3-Ref2VA-Acc-8Step.safetensors"
+    if not (os.path.exists(base) and os.path.exists(pdd)):
+        SKIP.append("bake_check_real_files (models absent)")
+        return
+    try:
+        import comfy_kitchen  # noqa: F401
+    except ImportError:
+        SKIP.append("bake_check_real_files (comfy_kitchen not importable)")
+        return
+    import bake_pdd_trunk as bake
+    worst = bake.audit(base, pdd, 1.0, sample=2)
+    assert worst < 2e-2, f"requant error {worst} above int8 storage noise"
+
+
+def test_apply_strength_zero_skips_trunk():
+    """lora_strength 0.0 = baked-trunk mode: add_patches must never run, heads
+    and sigmas still install, info says SKIPPED."""
+    pdd = "/workspace/ComfyUI/models/pdd_acc/MiniMax-H3-Ref2VA-Acc-8Step.safetensors"
+    if not os.path.exists(pdd):
+        SKIP.append("apply_strength_zero (PDD file absent)")
+        return
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "minimax_h3_pdd_acc_testpkg0", os.path.join(PACK, "__init__.py"),
+            submodule_search_locations=[PACK])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules["minimax_h3_pdd_acc_testpkg0"] = pkg
+        spec.loader.exec_module(pkg)
+    except Exception as e:
+        SKIP.append(f"apply_strength_zero (comfy not importable: {type(e).__name__})")
+        return
+
+    class _Lin:
+        def __init__(self, o, i):
+            self.weight = torch.zeros(o, i)
+
+    class _FakeFinalLayer:
+        def forward(self, *a, **k):
+            raise AssertionError("not called at install time")
+
+    class _FakePatcher:
+        def __init__(self):
+            self.fl = _FakeFinalLayer()
+            self.fl.video_out = _Lin(96, 5376)
+            self.fl.audio_out = _Lin(32, 5376)
+            self.calls = []
+
+        def get_model_object(self, name):
+            assert name == "diffusion_model.final_layer"
+            return self.fl
+
+        def clone(self):
+            return self
+
+        def add_patches(self, *a, **k):
+            raise AssertionError("add_patches called in baked-trunk mode")
+
+        def add_object_patch(self, *a):
+            self.calls.append("object_patch")
+
+        def remove_wrappers_with_key(self, *a):
+            pass
+
+        def add_wrapper_with_key(self, *a):
+            self.calls.append("wrapper")
+
+    node = pkg.NODE_CLASS_MAPPINGS["MiniMaxH3PDDAccApply"]()
+    fake = _FakePatcher()
+    m, sigmas, info = node.apply(
+        model=fake, pdd_file=os.path.basename(pdd), nfe="8", lora_strength=0.0,
+        head_strength=1.0, on_off_grid="error", partition_check="warn")
+    assert m is fake
+    assert "SKIPPED" in info and "baked-trunk" in info
+    assert sigmas.shape[0] == 9 and float(sigmas[-1]) == 0.0
+    assert "object_patch" in fake.calls and "wrapper" in fake.calls
 
 
 if __name__ == "__main__":
