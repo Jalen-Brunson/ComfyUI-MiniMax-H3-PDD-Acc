@@ -190,6 +190,20 @@ at low resolutions (issue #4 measured ~2× s/it at 864×480 on a 32GB RTX 5090) 
 into attention time at high ones. **If your model fully loads, baking buys you nothing** —
 the runtime path already costs zero per step there.
 
+Measured 2026-08-30 (H200, ref2va int8_convrot, 832×480×124f, 8 steps, SDPA; offload forced
+with `--reserve-vram 120` so the whole 32.4GB trunk streams — the log's `lowvram patches`
+count is the mechanism made visible):
+
+| regime | runtime patches | baked trunk |
+|---|---|---|
+| fully offloaded | 2.44 s/it (`lowvram patches: 258`) | **2.06 s/it** (`lowvram patches: 0`) |
+| fully loaded | 1.82 s/it | 1.75 s/it (same within noise) |
+
+The bake removes the per-forward patch term entirely; what remains in the offloaded row is
+pure weight streaming, which both arms pay equally. The patch term is hardware-dependent —
+~0.4 s/step on an H200, ~2.5 s/step in the issue-#4 5090 report — so the win grows as the
+card gets smaller, which is exactly who this is for.
+
 `bake_pdd_trunk.py` merges the trunk LoRA (and the adaln update — curve-rebased first on
 pruned bases) into the quantized checkpoint offline, using the same `comfy-kitchen` kernels
 ComfyUI dequantizes with. Only the head bank stays runtime — it swaps `final_layer` per
