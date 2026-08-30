@@ -1019,6 +1019,74 @@ def test_apply_strength_zero_skips_trunk():
     assert "object_patch" in fake.calls and "wrapper" in fake.calls
 
 
+def test_apply_partition_check_off():
+    """partition_check='off' skips the model-type (trunk fingerprint) analysis
+    entirely: even an unidentifiable/mismatched model video_out never triggers
+    the pairing check, and the info output says the guard is disabled."""
+    pdd = "/workspace/ComfyUI/models/pdd_acc/MiniMax-H3-Ref2VA-Acc-8Step.safetensors"
+    if not os.path.exists(pdd):
+        SKIP.append("apply_partition_check_off (PDD file absent)")
+        return
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "minimax_h3_pdd_acc_testpkg1", os.path.join(PACK, "__init__.py"),
+            submodule_search_locations=[PACK])
+        pkg = importlib.util.module_from_spec(spec)
+        sys.modules["minimax_h3_pdd_acc_testpkg1"] = pkg
+        spec.loader.exec_module(pkg)
+    except Exception as e:
+        SKIP.append(f"apply_partition_check_off (comfy not importable: {type(e).__name__})")
+        return
+
+    class _Lin:
+        def __init__(self, o, i):
+            self.weight = torch.zeros(o, i)
+
+    class _FakeFinalLayer:
+        def forward(self, *a, **k):
+            raise AssertionError("not called at install time")
+
+    class _FakePatcher:
+        def __init__(self):
+            self.fl = _FakeFinalLayer()
+            # deliberately NOT a real trunk fingerprint (zeros), and the file is
+            # ref2va — with the check ON this pair is unverifiable; OFF must not
+            # even probe it.
+            self.fl.video_out = _Lin(96, 5376)
+            self.fl.audio_out = _Lin(32, 5376)
+            self.calls = []
+
+        def get_model_object(self, name):
+            assert name == "diffusion_model.final_layer"
+            return self.fl
+
+        def clone(self):
+            return self
+
+        def add_patches(self, *a, **k):
+            self.calls.append("add_patches")
+
+        def add_object_patch(self, *a):
+            self.calls.append("object_patch")
+
+        def remove_wrappers_with_key(self, *a):
+            pass
+
+        def add_wrapper_with_key(self, *a):
+            self.calls.append("wrapper")
+
+    node = pkg.NODE_CLASS_MAPPINGS["MiniMaxH3PDDAccApply"]()
+    fake = _FakePatcher()
+    m, sigmas, info = node.apply(
+        model=fake, pdd_file=os.path.basename(pdd), nfe="8", lora_strength=0.0,
+        head_strength=1.0, on_off_grid="error", partition_check="off")
+    assert m is fake
+    assert "partition_check=off" in info and "OFF" in info
+    assert sigmas.shape[0] == 9 and float(sigmas[-1]) == 0.0
+    assert "object_patch" in fake.calls and "wrapper" in fake.calls
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:

@@ -242,7 +242,7 @@ class MiniMaxH3PDDAccApply:
             "bypass_sigmas": ("SIGMAS", {"tooltip": "Returned as the sigmas output when "
                                                     "enabled=False (e.g. a BasicScheduler for the "
                                                     "base model). Ignored when enabled."}),
-            "partition_check": (["error", "warn"],
+            "partition_check": (["error", "warn", "off"],
                                 {"default": "error",
                                  "tooltip": "fl2va and ref2va share identical key sets, so an "
                                             "FL2VA file on a ref2va UNET (or vice versa) applies "
@@ -250,7 +250,10 @@ class MiniMaxH3PDDAccApply:
                                             "model's trunk is identified from its "
                                             "final_layer.video_out fingerprint; a confident "
                                             "mismatch errors. 'warn' continues anyway "
-                                            "(deliberate cross-trunk experiments)."}),
+                                            "(deliberate cross-trunk experiments). 'off' = "
+                                            "disable the model-type analysis entirely: the "
+                                            "fingerprint check never runs, so nothing errors "
+                                            "or warns about a mispairing."}),
         }}
 
     RETURN_TYPES = ("MODEL", "SIGMAS", "STRING")
@@ -284,15 +287,21 @@ class MiniMaxH3PDDAccApply:
 
         # ---- partition fingerprint (before any patching: fail on a mispair
         # early). fl2va/ref2va key sets are identical, so a crossed pairing
-        # would otherwise apply cleanly and render silently wrong. ----
+        # would otherwise apply cleanly and render silently wrong. Set
+        # partition_check="off" to disable this model-type analysis entirely. ----
         meta = metadata or {}
-        file_partition = partition_from_name(
-            meta.get("pdd_partition"), meta.get("source_file"), pdd_file)
-        fp_note = check_partition_pairing(
-            model.get_model_object("diffusion_model.final_layer").video_out.weight,
-            _load_partition_fingerprints(), file_partition, pdd_file,
-            mode=partition_check)
-        logging.info("MiniMaxH3PDDAccApply: %s", fp_note)
+        if partition_check == "off":
+            fp_note = ("model-type check OFF (partition_check=off): trunk fingerprint "
+                       "analysis skipped — cross-trunk mispairings are NOT detected")
+            logging.info("MiniMaxH3PDDAccApply: %s", fp_note)
+        else:
+            file_partition = partition_from_name(
+                meta.get("pdd_partition"), meta.get("source_file"), pdd_file)
+            fp_note = check_partition_pairing(
+                model.get_model_object("diffusion_model.final_layer").video_out.weight,
+                _load_partition_fingerprints(), file_partition, pdd_file,
+                mode=partition_check)
+            logging.info("MiniMaxH3PDDAccApply: %s", fp_note)
 
         # ---- trunk LoRA (normal quant-aware patch path) ----
         # strength 0.0 is BAKED-TRUNK mode, not "apply at zero": a checkpoint
