@@ -822,6 +822,42 @@ def test_scheduler_denoise_slice_keeps_resume_sigma():
     assert float(s25[-1]) == 0.0 and float(s50[-1]) == 0.0
 
 
+def test_identify_trunk_survives_lying_tensor():
+    """Issue #3: a GGUF trunk's weight subclass reports the LOGICAL shape while
+    arithmetic runs on packed storage — the shape gate passes, the subtraction
+    raises. The check is advisory and must degrade to INCONCLUSIVE, not abort."""
+    ref = torch.randn(4, 8)
+
+    class _Lying:
+        shape = ref.shape
+
+        def detach(self):
+            return self
+
+        def to(self, *a, **k):
+            return self
+
+        def cpu(self):
+            return self
+
+        def __sub__(self, other):
+            raise RuntimeError("The size of tensor a (3024) must match the size "
+                               "of tensor b (5376) at non-singleton dimension 1")
+
+    part, dists = identify_trunk(_Lying(), {"fl2va": ref, "ref2va": ref + 0.1})
+    assert part is None and dists == {}
+    note = check_partition_pairing(_Lying(), {"fl2va": ref}, "ref2va", "f.safetensors",
+                                   mode="error")
+    assert "INCONCLUSIVE" in note
+
+    class _Unmaterializable:
+        def detach(self):
+            raise RuntimeError("cannot materialize")
+
+    part, dists = identify_trunk(_Unmaterializable(), {"fl2va": ref})
+    assert part is None and dists == {}
+
+
 def test_bake_synthetic_stream():
     """bake_pdd_trunk end to end on a tiny fabricated checkpoint: baked quant
     codes must equal the deterministic requant of the exact merge, plain-dtype

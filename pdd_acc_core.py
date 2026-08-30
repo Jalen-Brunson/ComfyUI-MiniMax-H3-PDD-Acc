@@ -496,14 +496,29 @@ def identify_trunk(video_out_weight, fingerprints, tol=PARTITION_TOLERANCE):
     """Match a live final_layer.video_out.weight against shipped fingerprints.
 
     fingerprints: {partition: weight tensor}. Returns (partition or None,
-    {partition: relative distance})."""
-    live = video_out_weight.detach().to(torch.float32).cpu()
+    {partition: relative distance}).
+
+    This is an ADVISORY check and must never abort a render, so every failure
+    degrades to "no match". The non-obvious failure (issue #3): GGUF trunks
+    hand us a tensor subclass whose reported .shape is the LOGICAL shape while
+    arithmetic runs on the packed storage — the shape gate passes and the
+    subtraction then raises a size mismatch (the reporter's 5376 -> 3024 is
+    exactly Q4_K's 9/16 packing). An opaque quantized weight is simply
+    unmatchable; `check_partition_pairing` already words the INCONCLUSIVE
+    note for that case."""
+    try:
+        live = video_out_weight.detach().to(torch.float32).cpu()
+    except Exception:
+        return None, {}
     dists = {}
     for name, ref in fingerprints.items():
         ref = ref.to(torch.float32)
         if ref.shape != live.shape:
             continue
-        dists[name] = float((live - ref).norm() / ref.norm())
+        try:
+            dists[name] = float((live - ref).norm() / ref.norm())
+        except Exception:
+            continue
     best = min(dists, key=dists.get) if dists else None
     if best is not None and dists[best] <= tol:
         return best, dists
